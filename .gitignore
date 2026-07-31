@@ -1,0 +1,117 @@
+# =====================================================================
+# This repository holds CODE AND DOCUMENTATION ONLY.
+# No instrument data, no sample information, no local paths.
+# Everything below is deliberately kept out of version control.
+# =====================================================================
+
+# ---- raw vendor data ------------------------------------------------
+# Agilent dataset and method directories, wherever they sit.
+*.d/
+*.D/
+*.m/
+*.M/
+
+# Raw instrument files, in case they ever appear outside a .d directory.
+# These carry instrument serial numbers, operator names, tune records,
+# acquisition paths and sample identities.
+*.bin
+*.xsd
+*.macaml
+*.mac
+*.ctl
+*.jtune.xml
+sample_info.xml
+sequence.xml
+sequence.log
+Contents.xml
+Devices.xml
+MSTS.xml
+MethodData*
+MethodInformation.xml
+SequenceData.xml
+InletInjectionParameters.xml
+*CumulativeAuditTrail.xml
+Acq.*.xml
+*.Monitors.xml
+acqmeth.txt
+acqmethtq.*
+method.txt
+method.ini
+methver.mac
+runstart.txt
+esignature.config
+*.INI
+GC.INI
+PRE_POST.INI
+TimeStamp.xml
+
+# Instrument reports (tune reports, method printouts) embed serials and
+# site details.
+*.pdf
+
+# ---- generated output -----------------------------------------------
+# Reproducible from the raw data with: python3 ingest/run_all.py
+ingested/
+out/
+output/
+
+# Converted spectra and extracted tables
+*.mzML
+*.mzml
+*.mzXML
+*.csv
+*.tsv
+manifest.json
+samples.csv
+
+# Figures
+*.png
+*.svg
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# ---- dataset- and site-specific notes -------------------------------
+# Kept locally: names the instrument, method, samples and findings.
+docs/session-summary.md
+docs/*-summary.md
+notes/
+scratch/
+*.local.md
+
+# ---- credentials and secrets ----------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*_rsa
+*_ed25519
+credentials*
+secrets*
+.netrc
+.authinfo*
+
+# ---- python / editor / OS -------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*~

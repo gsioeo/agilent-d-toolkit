@@ -1,0 +1,2542 @@
+Agilent MassHunter GC/MS .d toolkit -- portable patch
+=====================================================
+
+Recreates a self-contained toolkit that reads Agilent MassHunter `.d` datasets
+(MSScan.bin + MSPeak.bin) with no vendor software, and produces metadata
+manifests, chromatograms, summed spectra, extracted ion chromatograms and
+indexed mzML 1.1.0.
+
+Apply into any folder that contains `.d` directories:
+
+    cd /path/to/new/dataset/folder
+    patch -p1 < gcms-agilent-toolkit.patch
+    python3 ingest/run_all.py --mzml --verify
+
+`--verify` runs the extraction self-checks; they should report a max difference
+of exactly 0 against the TIC stored in the raw files.
+
+Contents
+    ingest/agilent_d.py       reader library: metadata, scans, spectra, EIC, mzML
+    ingest/ingest.py          stage 1: manifest, TIC, summed spectra, mzML
+    ingest/plot.py            stage 2: TIC and summed-spectrum figures
+    ingest/eic.py             stage 3: extracted ion chromatograms, peak table
+    ingest/run_all.py         all three stages under one set of options
+    ingest/make_patch.py      regenerates this patch
+    docs/agilent-d-format.md  binary layout reference and pitfalls
+    docs/toolkit.md           tool reference, output tree, validation, gotchas
+
+Requirements
+    python3      >= 3.8       reader is standard library only
+    numpy        optional     needed by eic.py and plot.py
+    matplotlib   optional     needed for the figures
+
+Nothing outside the target folder is touched, the source `.d` directories are
+only ever opened for reading, and output goes to `ingested/`.
+
+This patch carries code and documentation only -- no instrument data, no sample
+information, no local paths.
+
+Generated 2026-07-31 07:08:01-0400 -- 8 files, 2453 lines.
+    ingest/agilent_d.py          820 lines  sha256 5b085e98827a0853ac9fb1f9faf6dd22
+    ingest/ingest.py             270 lines  sha256 e3521909ab3618783cbf3c5668b9a837
+    ingest/plot.py               382 lines  sha256 f45544479c80889699ca1119d063b211
+    ingest/eic.py                378 lines  sha256 bde064cf857afa588b5d344f438121d8
+    ingest/run_all.py            137 lines  sha256 0c6652e31134df6cc317e475fe17b880
+    ingest/make_patch.py         113 lines  sha256 c59796af7b2aca4ec7cd392d49144822
+    docs/agilent-d-format.md     186 lines  sha256 a2a8308f420105926c0115bfacd346c2
+    docs/toolkit.md              167 lines  sha256 d0307856352abcfd45a0b3ee810db303
+--- 8< --- patch body below, do not edit --- 8< ---
+
+diff --git a/ingest/agilent_d.py b/ingest/agilent_d.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/agilent_d.py
+@@ -0,0 +1,820 @@
++"""Reader for Agilent MassHunter GC/MS ``.d`` datasets (MSScan.bin + MSPeak.bin).
++
++Pure standard library -- no numpy/pandas required.
++
++Binary layout
++-------------
++``AcqData/MSScan.bin`` is an int32 at offset 0x58 giving the start of a packed
++array of fixed-size scan records.  The record fields are exactly the sequence
++declared in ``AcqData/MSScan.xsd`` (ScanRecordType followed by one
++SpectrumParamsType), stored little-endian with no padding -> 184 bytes.
++
++``AcqData/MSPeak.bin`` holds the centroid peak lists.  For each scan,
++``SpectrumOffset`` points at ``PointCount`` little-endian float32 m/z values
++immediately followed by ``PointCount`` float32 abundances (``ByteCount`` ==
++``PointCount`` * 8).
++
++This layout was validated against every scan of this dataset: the sum of the
++decoded abundances reproduces the stored ``TIC``, the abundance argmax
++reproduces ``BasePeakMZ``/``BasePeakValue``, the m/z arrays are monotonic and
++span ``MinX``..``MaxX``, and the last peak block ends exactly at EOF.
++
++Only the standard library is required.  If numpy happens to be installed,
++:meth:`AgilentDotD.flat_peaks` and :meth:`AgilentDotD.eic` become available and
++give fast vectorised extracted-ion chromatograms; :meth:`AgilentDotD.xic` is the
++pure-python equivalent.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import mmap
++import os
++import struct
++import xml.etree.ElementTree as ET
++import zlib
++from typing import Dict, Iterator, List, NamedTuple, Optional, Sequence, Tuple
++
++__all__ = ["AgilentDotD", "ScanRecord", "find_datasets", "EIC_EDGE"]
++
++# ---------------------------------------------------------------------------
++# MSScan.bin record
++# ---------------------------------------------------------------------------
++
++_REC = struct.Struct("<3i d 2i 3d 4i 7d 2i i q 2i 4d")
++assert _REC.size == 184
++_DATA_OFFSET_POS = 0x58
++
++#: Window slack (u) added on each side of an EIC target -- see
++#: :meth:`AgilentDotD.eic_window`.  Far below the 0.1 u acquisition step.
++EIC_EDGE = 1e-4
++
++
++class ScanRecord(NamedTuple):
++    scan_id: int
++    scan_method_id: int
++    time_segment_id: int
++    scan_time: float           # minutes
++    ms_level: int
++    scan_type: int
++    tic: float
++    base_peak_mz: float
++    base_peak_value: float
++    cycle_number: int
++    status: int
++    ion_mode: int
++    ion_polarity: int
++    fragmentor: float
++    collision_energy: float
++    mz_of_interest: float
++    sampling_period: float
++    mass_range_min: float
++    mass_range_max: float
++    threshold: float
++    is_fragmentor_dynamic: int
++    is_collision_energy_dynamic: int
++    spectrum_format_id: int
++    spectrum_offset: int
++    byte_count: int
++    point_count: int
++    min_y: float
++    max_y: float
++    min_x: float
++    max_x: float
++
++
++# Agilent enum -> label.  Values seen in this dataset are marked; the rest come
++# from the MassHunter data-access documentation and are best-effort labels.
++SCAN_TYPES = {1: "Scan", 2: "SelectedIon", 4: "HighResolutionScan",
++              8: "TotalIon", 256: "MultipleReaction", 512: "ProductIon",
++              1024: "PrecursorIon", 2048: "NeutralGain", 4096: "NeutralLoss"}
++ION_MODES = {0: "Unspecified", 1: "Mixed", 2: "EI", 4: "CI", 8: "Maldi",
++             16: "Appi", 32: "Apci", 64: "Esi", 128: "NanoEsi",
++             512: "MsChip", 1024: "ICP", 2048: "Jetstream"}
++ION_POLARITY = {0: "positive", 1: "negative", 2: "unassigned", 3: "mixed"}
++
++
++# ---------------------------------------------------------------------------
++# helpers
++# ---------------------------------------------------------------------------
++
++def _xml_root(path: str):
++    if not os.path.exists(path):
++        return None
++    # Agilent writes some of these with a UTF-8 BOM.
++    with open(path, "rb") as fh:
++        raw = fh.read()
++    if raw.startswith(b"\xef\xbb\xbf"):
++        raw = raw[3:]
++    try:
++        return ET.fromstring(raw)
++    except ET.ParseError:
++        return None
++
++
++def _localname(tag: str) -> str:
++    return tag.rsplit("}", 1)[-1]
++
++
++def decode_text_file(path: str) -> Optional[str]:
++    """Decode an Agilent text report (UTF-16LE with BOM, or UTF-8)."""
++    if not os.path.exists(path):
++        return None
++    with open(path, "rb") as fh:
++        raw = fh.read()
++    for bom, enc in ((b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be"),
++                     (b"\xef\xbb\xbf", "utf-8")):
++        if raw.startswith(bom):
++            return raw[len(bom):].decode(enc, "replace")
++    for enc in ("utf-8", "gb18030", "latin-1"):
++        try:
++            return raw.decode(enc)
++        except UnicodeDecodeError:
++            continue
++    return raw.decode("latin-1", "replace")
++
++
++def find_datasets(root: str) -> List[str]:
++    """All ``*.d`` directories under *root* (recursively), sorted."""
++    out = []
++    for dirpath, dirnames, _ in os.walk(root):
++        for d in list(dirnames):
++            if d.lower().endswith(".d"):
++                out.append(os.path.join(dirpath, d))
++                dirnames.remove(d)          # don't descend into the .d
++    return sorted(out)
++
++
++# ---------------------------------------------------------------------------
++# main reader
++# ---------------------------------------------------------------------------
++
++class AgilentDotD:
++    def __init__(self, path: str):
++        self.path = os.path.abspath(path.rstrip(os.sep))
++        self.name = os.path.basename(self.path)
++        if self.name.lower().endswith(".d"):
++            self.name = self.name[:-2]
++        self.acqdata = os.path.join(self.path, "AcqData")
++        if not os.path.isdir(self.acqdata):
++            raise ValueError("not an Agilent .d dataset (no AcqData): %s" % path)
++
++        self._scans: Optional[List[ScanRecord]] = None
++        self._flat = None
++        self._peak_mm = None
++        self._peak_fh = None
++
++        self.sample_info = self._read_sample_info()
++        self.contents = self._read_contents()
++        self.devices = self._read_devices()
++        self.time_segments = self._read_time_segments()
++        self.method_dir = self._find_method_dir()
++        self.ms_method = self._read_ms_method()
++
++    # -- context manager ---------------------------------------------------
++    def __enter__(self):
++        return self
++
++    def __exit__(self, *exc):
++        self.close()
++        return False
++
++    def close(self):
++        if self._peak_mm is not None:
++            self._peak_mm.close()
++            self._peak_mm = None
++        if self._peak_fh is not None:
++            self._peak_fh.close()
++            self._peak_fh = None
++
++    # -- metadata ----------------------------------------------------------
++    def _read_sample_info(self) -> Dict[str, str]:
++        root = _xml_root(os.path.join(self.acqdata, "sample_info.xml"))
++        info: Dict[str, str] = {}
++        if root is None:
++            return info
++        for field in root.findall("Field"):
++            name = (field.findtext("Name") or "").strip()
++            disp = (field.findtext("DisplayName") or "").strip()
++            val = (field.findtext("Value") or "").strip()
++            # Some rows have a numeric hash as <Name>; the DisplayName is the
++            # only human-readable key in that case.
++            key = name if name and not name.isdigit() else disp
++            if key:
++                info[key] = val
++        return info
++
++    def _read_contents(self) -> Dict[str, str]:
++        root = _xml_root(os.path.join(self.acqdata, "Contents.xml"))
++        if root is None:
++            return {}
++        return {_localname(c.tag): (c.text or "").strip() for c in root}
++
++    def _read_devices(self) -> List[Dict[str, str]]:
++        root = _xml_root(os.path.join(self.acqdata, "Devices.xml"))
++        if root is None:
++            return []
++        out = []
++        for dev in root.findall("Device"):
++            d = {_localname(c.tag): (c.text or "").strip() for c in dev}
++            d["DeviceID"] = dev.get("DeviceID", "")
++            out.append(d)
++        return out
++
++    def _read_time_segments(self) -> List[Dict[str, str]]:
++        root = _xml_root(os.path.join(self.acqdata, "MSTS.xml"))
++        if root is None:
++            return []
++        out = []
++        for seg in root.findall("TimeSegment"):
++            d = {_localname(c.tag): (c.text or "").strip() for c in seg}
++            d["TimeSegmentID"] = seg.get("TimeSegmentID", "")
++            out.append(d)
++        return out
++
++    def _find_method_dir(self) -> Optional[str]:
++        for entry in sorted(os.listdir(self.acqdata)):
++            p = os.path.join(self.acqdata, entry)
++            if entry.lower().endswith(".m") and os.path.isdir(p):
++                return p
++        return None
++
++    @property
++    def method_name(self) -> str:
++        if self.method_dir:
++            return os.path.basename(self.method_dir)
++        return self.sample_info.get("Method", "")
++
++    def _read_ms_method(self) -> Dict[str, object]:
++        """Flatten the interesting parts of ``qqqacqmethod.xml``."""
++        if not self.method_dir:
++            return {}
++        root = _xml_root(os.path.join(self.method_dir, "qqqacqmethod.xml"))
++        if root is None:
++            return {}
++        m: Dict[str, object] = {}
++        for tag in ("msInstrument", "ionSource", "tuneFile", "stopMode",
++                    "stopTime", "solventDelay", "collisionGasOn", "useGain",
++                    "enableNR", "isTimeFilterEnabled", "timeFilterPeakWidth"):
++            txt = root.findtext(tag)
++            if txt is not None:
++                m[tag] = txt.strip()
++        srcs = {}
++        for sp in root.iter("sourceParameter"):
++            srcs[(sp.findtext("id") or "").strip()] = (
++                sp.findtext("posPolarityValue") or "").strip()
++        if srcs:
++            m["sourceParameters"] = srcs
++        segs = []
++        for seg in root.iter("timeSegment"):
++            s = {"index": seg.findtext("index"),
++                 "startTime": seg.findtext("startTime"),
++                 "scanSegments": []}
++            for ss in seg.iter("scanSegment"):
++                d = {"index": ss.findtext("index"),
++                     "scanType": ss.findtext("scanType"),
++                     "scanTime": ss.findtext("scanTime"),
++                     "dataStorage": ss.findtext("dataStorage"),
++                     "threshold": ss.findtext("threshold"),
++                     "scanElements": []}
++                for se in ss.iter("scanElement"):
++                    d["scanElements"].append(
++                        {_localname(c.tag): (c.text or "").strip() for c in se})
++                s["scanSegments"].append(d)
++            segs.append(s)
++        if segs:
++            m["timeSegments"] = segs
++        return m
++
++    def method_text(self) -> Optional[str]:
++        """Decoded ``acqmeth.txt`` (the human-readable method printout)."""
++        for cand in (os.path.join(self.path, "acqmeth.txt"),
++                     os.path.join(self.method_dir or "", "acqmeth.txt")):
++            if cand and os.path.exists(cand):
++                return decode_text_file(cand)
++        return None
++
++    # -- convenience accessors --------------------------------------------
++    @property
++    def sample_name(self) -> str:
++        return self.sample_info.get("Sample Name") or self.name
++
++    @property
++    def acquired_time(self) -> str:
++        return (self.contents.get("AcquiredTime")
++                or self.sample_info.get("AcqTime", ""))
++
++    @property
++    def instrument(self) -> str:
++        return (self.contents.get("InstrumentName")
++                or self.sample_info.get("InstrumentName", ""))
++
++    @property
++    def ms_device(self) -> Dict[str, str]:
++        for d in self.devices:
++            if d.get("Name", "").lower().startswith(("tandemquad", "quad", "ms")):
++                return d
++        return self.devices[0] if self.devices else {}
++
++    # -- scan table --------------------------------------------------------
++    @property
++    def scans(self) -> List[ScanRecord]:
++        if self._scans is None:
++            self._scans = self._read_scan_table()
++        return self._scans
++
++    def _read_scan_table(self) -> List[ScanRecord]:
++        p = os.path.join(self.acqdata, "MSScan.bin")
++        with open(p, "rb") as fh:
++            buf = fh.read()
++        size = len(buf)
++        if size < _DATA_OFFSET_POS + 4:
++            raise ValueError("MSScan.bin too small: %s" % p)
++
++        start = struct.unpack_from("<i", buf, _DATA_OFFSET_POS)[0]
++        if not (0 < start <= size and (size - start) % _REC.size == 0):
++            start = self._probe_data_offset(buf)
++        n = (size - start) // _REC.size
++        return [ScanRecord(*_REC.unpack_from(buf, start + i * _REC.size))
++                for i in range(n)]
++
++    @staticmethod
++    def _probe_data_offset(buf: bytes) -> int:
++        """Fallback: find the record array start by consistency checks."""
++        size = len(buf)
++        for off in range(4, min(4096, size), 4):
++            if (size - off) % _REC.size:
++                continue
++            r = ScanRecord(*_REC.unpack_from(buf, off))
++            if r.scan_id == 1 and 0.0 <= r.scan_time < 10000.0 and \
++                    r.point_count >= 0 and r.byte_count == r.point_count * 8:
++                return off
++        raise ValueError("could not locate MSScan.bin record array")
++
++    def __len__(self) -> int:
++        return len(self.scans)
++
++    # -- spectra -----------------------------------------------------------
++    def _peaks(self) -> mmap.mmap:
++        if self._peak_mm is None:
++            self._peak_fh = open(os.path.join(self.acqdata, "MSPeak.bin"), "rb")
++            self._peak_mm = mmap.mmap(self._peak_fh.fileno(), 0,
++                                      access=mmap.ACCESS_READ)
++        return self._peak_mm
++
++    def spectrum(self, index: int) -> Tuple[Sequence[float], Sequence[float]]:
++        """Centroid spectrum for scan *index* as ``(mz, abundance)``."""
++        r = self.scans[index]
++        if r.point_count <= 0:
++            return (), ()
++        mm = self._peaks()
++        n = r.point_count
++        mz = struct.unpack_from("<%df" % n, mm, r.spectrum_offset)
++        ab = struct.unpack_from("<%df" % n, mm, r.spectrum_offset + n * 4)
++        return mz, ab
++
++    def iter_spectra(self) -> Iterator[Tuple[ScanRecord, Sequence[float],
++                                             Sequence[float]]]:
++        for i, r in enumerate(self.scans):
++            mz, ab = self.spectrum(i)
++            yield r, mz, ab
++
++    # -- derived traces ----------------------------------------------------
++    def tic(self) -> Tuple[List[float], List[float]]:
++        rt = [r.scan_time for r in self.scans]
++        return rt, [r.tic for r in self.scans]
++
++    def xic(self, mz_low: float, mz_high: float) -> Tuple[List[float],
++                                                          List[float]]:
++        """Extracted ion chromatogram, summing peaks in [mz_low, mz_high].
++
++        Pure python; see :meth:`eic` for the vectorised version.
++        """
++        rt, sig = [], []
++        for r, mz, ab in self.iter_spectra():
++            rt.append(r.scan_time)
++            total = 0.0
++            for m, a in zip(mz, ab):
++                if mz_low <= m <= mz_high:
++                    total += a
++            sig.append(total)
++        return rt, sig
++
++    # -- numpy-accelerated extraction --------------------------------------
++    def flat_peaks(self):
++        """Every centroid of the run as ``(mz, abundance, scan_index)``.
++
++        Three parallel numpy arrays covering all scans, cached on the instance.
++        ``scan_index`` is the 0-based position in :attr:`scans`.  m/z and
++        abundance are widened to float64 (lossless from the stored float32) so
++        that window comparisons behave identically to :meth:`xic`, which works
++        in python floats.
++        """
++        if getattr(self, "_flat", None) is not None:
++            return self._flat
++        try:
++            import numpy as np
++        except ImportError as exc:                      # pragma: no cover
++            raise ImportError("flat_peaks()/eic() need numpy; use xic() "
++                              "for the pure-python version") from exc
++
++        mm = self._peaks()
++        total = sum(r.point_count for r in self.scans)
++        mz = np.empty(total, dtype=np.float64)
++        ab = np.empty(total, dtype=np.float64)
++        idx = np.empty(total, dtype=np.int32)
++        pos = 0
++        for i, r in enumerate(self.scans):
++            n = r.point_count
++            if n <= 0:
++                continue
++            off = r.spectrum_offset
++            mz[pos:pos + n] = np.frombuffer(mm, dtype="<f4", count=n,
++                                            offset=off)
++            ab[pos:pos + n] = np.frombuffer(mm, dtype="<f4", count=n,
++                                            offset=off + n * 4)
++            idx[pos:pos + n] = i
++            pos += n
++        assert pos == total, (pos, total)
++        self._flat = (mz, ab, idx)
++        return self._flat
++
++    def rt_array(self):
++        import numpy as np
++        return np.asarray([r.scan_time for r in self.scans], dtype=float)
++
++    def eic_window(self, target: float, tol: float) -> Tuple[float, float]:
++        """Inclusive m/z window used by :meth:`eic` for *target* +/- *tol*.
++
++        Widened by :data:`EIC_EDGE` so that centroids sitting exactly on the
++        window edge are included deterministically.  This matters here: the
++        acquisition steps m/z in 0.1 u, values are stored as float32, and a
++        request like 81 +/- 0.3 lands its edges precisely on the 80.7 and 81.3
++        grid points, where float rounding would otherwise decide the outcome.
++        """
++        return (target - tol - EIC_EDGE, target + tol + EIC_EDGE)
++
++    def eic(self, targets, tol: float = 0.3):
++        """Extracted ion chromatograms for one or more target m/z.
++
++        *targets* is a single m/z or an iterable of them; every centroid inside
++        :meth:`eic_window` is summed into that target's trace.
++
++        Returns ``(rt, traces)`` where ``rt`` has one entry per scan and
++        ``traces`` is a 2-D array of shape ``(len(targets), n_scans)``.  A
++        scalar *targets* yields a 1-D trace.
++        """
++        import numpy as np
++
++        single = isinstance(targets, (int, float))
++        tlist = [float(targets)] if single else [float(t) for t in targets]
++        mz, ab, idx = self.flat_peaks()
++        n = len(self.scans)
++        out = np.zeros((len(tlist), n), dtype=float)
++        for k, t in enumerate(tlist):
++            lo, hi = self.eic_window(t, tol)
++            sel = (mz >= lo) & (mz <= hi)
++            if sel.any():
++                out[k] = np.bincount(idx[sel], weights=ab[sel], minlength=n)
++        rt = self.rt_array()
++        return (rt, out[0]) if single else (rt, out)
++
++    def average_spectrum(self, decimals: int = 1,
++                         rt_range: Optional[Tuple[float, float]] = None
++                         ) -> List[Tuple[float, float, int]]:
++        """Summed spectrum binned to *decimals* places.
++
++        Returns ``(mz, summed_abundance, n_scans_contributing)`` sorted by m/z.
++        """
++        acc: Dict[float, List[float]] = {}
++        for r, mz, ab in self.iter_spectra():
++            if rt_range and not (rt_range[0] <= r.scan_time <= rt_range[1]):
++                continue
++            for m, a in zip(mz, ab):
++                key = round(m, decimals)
++                slot = acc.get(key)
++                if slot is None:
++                    acc[key] = [a, 1]
++                else:
++                    slot[0] += a
++                    slot[1] += 1
++        return [(k, v[0], int(v[1])) for k, v in sorted(acc.items())]
++
++    # -- mzML export -------------------------------------------------------
++    def write_mzml(self, out_path: str, compress: bool = True) -> str:
++        """Write an indexedmzML 1.1.0 file with all centroid scans + the TIC."""
++        writer = _MzMLWriter(self, out_path, compress=compress)
++        return writer.run()
++
++
++# ---------------------------------------------------------------------------
++# mzML 1.1.0 writer
++# ---------------------------------------------------------------------------
++
++def _esc(s: object) -> str:
++    return (str(s).replace("&", "&amp;").replace("<", "&lt;")
++            .replace(">", "&gt;").replace('"', "&quot;"))
++
++
++def _num(x: float) -> str:
++    """Shortest decimal string that round-trips the float exactly."""
++    return repr(float(x))
++
++
++def _ncname(s: str, prefix: str = "run_") -> str:
++    """Make *s* usable as an mzML id (XML NCName: no leading digit, no colon)."""
++    out = "".join(c if (c.isalnum() or c in "_-.") else "_" for c in str(s))
++    if not out or not (out[0].isalpha() or out[0] == "_"):
++        out = prefix + out
++    return out
++
++
++def _encode_array(values: Sequence[float], compress: bool) -> Tuple[bytes, bool]:
++    raw = struct.pack("<%df" % len(values), *values)
++    if compress and raw:
++        comp = zlib.compress(raw, 6)
++        if len(comp) < len(raw):
++            return base64.b64encode(comp), True
++    return base64.b64encode(raw), False
++
++
++class _MzMLWriter:
++    def __init__(self, ds: AgilentDotD, out_path: str, compress: bool = True):
++        self.ds = ds
++        self.out_path = out_path
++        self.compress = compress
++        self.fh = None
++        self.spec_offsets: List[Tuple[str, int]] = []
++        self.chrom_offsets: List[Tuple[str, int]] = []
++
++    # -- low level ---------------------------------------------------------
++    def _w(self, text: str):
++        self.fh.write(text.encode("utf-8"))
++
++    def _pos(self) -> int:
++        self.fh.flush()
++        return self.fh.tell()
++
++    def _binary_array(self, values: Sequence[float], kind: str, indent: str):
++        """kind: 'mz' | 'intensity' | 'time'"""
++        b64, compressed = _encode_array(values, self.compress)
++        self._w('%s<binaryDataArray encodedLength="%d">\n' % (indent, len(b64)))
++        self._w('%s  <cvParam cvRef="MS" accession="MS:1000521" '
++                'name="32-bit float" value=""/>\n' % indent)
++        self._w('%s  <cvParam cvRef="MS" accession="%s" name="%s" value=""/>\n'
++                % (indent, "MS:1000574" if compressed else "MS:1000576",
++                   "zlib compression" if compressed else "no compression"))
++        if kind == "mz":
++            self._w('%s  <cvParam cvRef="MS" accession="MS:1000514" '
++                    'name="m/z array" value="" unitCvRef="MS" '
++                    'unitAccession="MS:1000040" unitName="m/z"/>\n' % indent)
++        elif kind == "intensity":
++            self._w('%s  <cvParam cvRef="MS" accession="MS:1000515" '
++                    'name="intensity array" value="" unitCvRef="MS" '
++                    'unitAccession="MS:1000131" '
++                    'unitName="number of detector counts"/>\n' % indent)
++        else:
++            self._w('%s  <cvParam cvRef="MS" accession="MS:1000595" '
++                    'name="time array" value="" unitCvRef="UO" '
++                    'unitAccession="UO:0000031" unitName="minute"/>\n' % indent)
++        if b64:
++            self._w('%s  <binary>%s</binary>\n' % (indent, b64.decode("ascii")))
++        else:
++            self._w('%s  <binary/>\n' % indent)
++        self._w('%s</binaryDataArray>\n' % indent)
++
++    # -- document ----------------------------------------------------------
++    def run(self) -> str:
++        ds = self.ds
++        os.makedirs(os.path.dirname(os.path.abspath(self.out_path)) or ".",
++                    exist_ok=True)
++        with open(self.out_path, "wb") as fh:
++            self.fh = fh
++            self._header()
++            self._spectrum_list()
++            self._chromatogram_list()
++            self._w("  </run>\n</mzML>\n")
++            index_offset = self._pos()
++            self._index()
++            self._w("<indexListOffset>%d</indexListOffset>\n" % index_offset)
++            self._w("<fileChecksum>")
++            fh.flush()
++            digest = self._sha1_upto(fh.tell())
++            self._w("%s</fileChecksum>\n</indexedmzML>\n" % digest)
++        self.fh = None
++        return self.out_path
++
++    def _sha1_upto(self, nbytes: int) -> str:
++        h = hashlib.sha1()
++        with open(self.out_path, "rb") as f:
++            left = nbytes
++            while left > 0:
++                chunk = f.read(min(1 << 20, left))
++                if not chunk:
++                    break
++                left -= len(chunk)
++                h.update(chunk)
++        return h.hexdigest()
++
++    def _header(self):
++        ds = self.ds
++        dev = ds.ms_device
++        model = dev.get("ModelNumber", "")
++        serial = dev.get("SerialNumber", "")
++        run_id = _esc(_ncname(ds.name))
++        sample_name = ds.sample_name
++        src_dir = os.path.basename(ds.path)
++
++        self._w('<?xml version="1.0" encoding="utf-8"?>\n')
++        self._w('<indexedmzML xmlns="http://psi.hupo.org/ms/mzml" '
++                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
++                'xsi:schemaLocation="http://psi.hupo.org/ms/mzml '
++                'http://psidev.info/files/ms/mzML/xsd/mzML1.1.2_idx.xsd">\n')
++        self._w('<mzML xmlns="http://psi.hupo.org/ms/mzml" '
++                'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
++                'xsi:schemaLocation="http://psi.hupo.org/ms/mzml '
++                'http://psidev.info/files/ms/mzML/xsd/mzML1.1.0.xsd" '
++                'version="1.1.0" id="%s">\n' % run_id)
++        self._w('  <cvList count="2">\n'
++                '    <cv id="MS" fullName="PSI-MS controlled vocabulary" '
++                'version="4.1.0" URI="https://raw.githubusercontent.com/'
++                'HUPO-PSI/psi-ms-CV/master/psi-ms.obo"/>\n'
++                '    <cv id="UO" fullName="Unit Ontology" version="releases/'
++                '2020-03-10" URI="http://purl.obolibrary.org/obo/uo.obo"/>\n'
++                '  </cvList>\n')
++
++        self._w('  <fileDescription>\n    <fileContent>\n'
++                '      <cvParam cvRef="MS" accession="MS:1000579" '
++                'name="MS1 spectrum" value=""/>\n'
++                '      <cvParam cvRef="MS" accession="MS:1000127" '
++                'name="centroid spectrum" value=""/>\n'
++                '    </fileContent>\n')
++        self._w('    <sourceFileList count="1">\n'
++                '      <sourceFile id="RAW" name="%s" location="file://%s">\n'
++                '        <cvParam cvRef="MS" accession="MS:1001509" '
++                'name="Agilent MassHunter format" value=""/>\n'
++                '        <cvParam cvRef="MS" accession="MS:1001508" '
++                'name="Agilent MassHunter nativeID format" value=""/>\n'
++                '      </sourceFile>\n    </sourceFileList>\n'
++                % (_esc(src_dir), _esc(os.path.dirname(self.ds.path))))
++        self._w('  </fileDescription>\n')
++
++        self._w('  <sampleList count="1">\n'
++                '    <sample id="SAMPLE1" name="%s">\n'
++                '      <userParam name="vial" value="%s"/>\n'
++                '      <userParam name="injection volume (uL)" value="%s"/>\n'
++                '      <userParam name="dilution" value="%s"/>\n'
++                '    </sample>\n  </sampleList>\n'
++                % (_esc(sample_name),
++                   _esc(ds.sample_info.get("Sample Position", "")),
++                   _esc(ds.sample_info.get("Inj Vol (\u00b5l)", "")),
++                   _esc(ds.sample_info.get("Dilution", ""))))
++
++        self._w('  <softwareList count="2">\n'
++                '    <software id="acquisition" version="%s">\n'
++                '      <cvParam cvRef="MS" accession="MS:1000678" '
++                'name="MassHunter Data Acquisition" value=""/>\n'
++                '    </software>\n'
++                '    <software id="ingest" version="1.0">\n'
++                '      <cvParam cvRef="MS" accession="MS:1000799" '
++                'name="custom unreleased software tool" '
++                'value="agilent_d.py"/>\n'
++                '    </software>\n  </softwareList>\n'
++                % _esc(self.ds.contents.get("AcqSoftwareVersion", "unknown")))
++
++        self._w('  <instrumentConfigurationList count="1">\n'
++                '    <instrumentConfiguration id="IC1">\n'
++                '      <cvParam cvRef="MS" accession="MS:1000490" '
++                'name="Agilent instrument model" value=""/>\n'
++                '      <userParam name="model number" value="%s"/>\n'
++                '      <userParam name="serial number" value="%s"/>\n'
++                '      <componentList count="3">\n'
++                '        <source order="1">\n'
++                '          <cvParam cvRef="MS" accession="MS:1000389" '
++                'name="electron ionization" value=""/>\n'
++                '        </source>\n'
++                '        <analyzer order="2">\n'
++                '          <cvParam cvRef="MS" accession="MS:1000081" '
++                'name="quadrupole" value=""/>\n'
++                '        </analyzer>\n'
++                '        <detector order="3">\n'
++                '          <cvParam cvRef="MS" accession="MS:1000253" '
++                'name="electron multiplier" value=""/>\n'
++                '        </detector>\n'
++                '      </componentList>\n'
++                '      <softwareRef ref="acquisition"/>\n'
++                '    </instrumentConfiguration>\n'
++                '  </instrumentConfigurationList>\n'
++                % (_esc(model), _esc(serial)))
++
++        self._w('  <dataProcessingList count="1">\n'
++                '    <dataProcessing id="DP1">\n'
++                '      <processingMethod order="1" softwareRef="ingest">\n'
++                '        <cvParam cvRef="MS" accession="MS:1000544" '
++                'name="Conversion to mzML" value=""/>\n'
++                '      </processingMethod>\n'
++                '    </dataProcessing>\n  </dataProcessingList>\n')
++
++        started = self.ds.acquired_time or ""
++        self._w('  <run id="%s" defaultInstrumentConfigurationRef="IC1" '
++                'sampleRef="SAMPLE1" startTimeStamp="%s">\n'
++                % (run_id, _esc(started)))
++
++    def _spectrum_list(self):
++        ds = self.ds
++        n = len(ds.scans)
++        self._w('    <spectrumList count="%d" '
++                'defaultDataProcessingRef="DP1">\n' % n)
++        for i, r in enumerate(ds.scans):
++            native = "scanId=%d" % r.scan_id
++            self._w('      ')
++            # mzML index offsets must point at the '<spectrum' byte itself.
++            self.spec_offsets.append((native, self._pos()))
++            mz, ab = ds.spectrum(i)
++            self._w('<spectrum index="%d" id="%s" defaultArrayLength="%d">\n'
++                    % (i, native, len(mz)))
++            self._w('        <cvParam cvRef="MS" accession="MS:1000579" '
++                    'name="MS1 spectrum" value=""/>\n')
++            self._w('        <cvParam cvRef="MS" accession="MS:1000511" '
++                    'name="ms level" value="%d"/>\n' % max(1, r.ms_level))
++            self._w('        <cvParam cvRef="MS" accession="MS:1000127" '
++                    'name="centroid spectrum" value=""/>\n')
++            self._w('        <cvParam cvRef="MS" accession="MS:1000%s" '
++                    'name="%s scan" value=""/>\n'
++                    % ("130" if r.ion_polarity == 0 else "129",
++                       "positive" if r.ion_polarity == 0 else "negative"))
++            self._w('        <cvParam cvRef="MS" accession="MS:1000285" '
++                    'name="total ion current" value="%s"/>\n' % _num(r.tic))
++            if mz:
++                self._w('        <cvParam cvRef="MS" accession="MS:1000504" '
++                        'name="base peak m/z" value="%s" unitCvRef="MS" '
++                        'unitAccession="MS:1000040" unitName="m/z"/>\n'
++                        % _num(r.base_peak_mz))
++                self._w('        <cvParam cvRef="MS" accession="MS:1000505" '
++                        'name="base peak intensity" value="%s" '
++                        'unitCvRef="MS" unitAccession="MS:1000131" '
++                        'unitName="number of detector counts"/>\n'
++                        % _num(r.base_peak_value))
++                self._w('        <cvParam cvRef="MS" accession="MS:1000528" '
++                        'name="lowest observed m/z" value="%s" '
++                        'unitCvRef="MS" unitAccession="MS:1000040" '
++                        'unitName="m/z"/>\n' % _num(r.min_x))
++                self._w('        <cvParam cvRef="MS" accession="MS:1000527" '
++                        'name="highest observed m/z" value="%s" '
++                        'unitCvRef="MS" unitAccession="MS:1000040" '
++                        'unitName="m/z"/>\n' % _num(r.max_x))
++            self._w('        <scanList count="1">\n'
++                    '          <cvParam cvRef="MS" accession="MS:1000795" '
++                    'name="no combination" value=""/>\n'
++                    '          <scan>\n'
++                    '            <cvParam cvRef="MS" accession="MS:1000016" '
++                    'name="scan start time" value="%s" unitCvRef="UO" '
++                    'unitAccession="UO:0000031" unitName="minute"/>\n'
++                    % _num(r.scan_time))
++            self._w('            <scanWindowList count="1">\n'
++                    '              <scanWindow>\n'
++                    '                <cvParam cvRef="MS" '
++                    'accession="MS:1000501" name="scan window lower limit" '
++                    'value="%s" unitCvRef="MS" unitAccession="MS:1000040" '
++                    'unitName="m/z"/>\n'
++                    '                <cvParam cvRef="MS" '
++                    'accession="MS:1000500" name="scan window upper limit" '
++                    'value="%s" unitCvRef="MS" unitAccession="MS:1000040" '
++                    'unitName="m/z"/>\n'
++                    '              </scanWindow>\n'
++                    '            </scanWindowList>\n'
++                    '          </scan>\n        </scanList>\n'
++                    % (_num(r.mass_range_min), _num(r.mass_range_max)))
++            self._w('        <binaryDataArrayList count="2">\n')
++            self._binary_array(mz, "mz", "          ")
++            self._binary_array(ab, "intensity", "          ")
++            self._w('        </binaryDataArrayList>\n')
++            self._w('      </spectrum>\n')
++        self._w('    </spectrumList>\n')
++
++    def _chromatogram_list(self):
++        rt, sig = self.ds.tic()
++        self._w('    <chromatogramList count="1" '
++                'defaultDataProcessingRef="DP1">\n')
++        self._w('      ')
++        self.chrom_offsets.append(("TIC", self._pos()))
++        self._w('<chromatogram index="0" id="TIC" '
++                'defaultArrayLength="%d">\n' % len(rt))
++        self._w('        <cvParam cvRef="MS" accession="MS:1000235" '
++                'name="total ion current chromatogram" value=""/>\n')
++        self._w('        <binaryDataArrayList count="2">\n')
++        self._binary_array(rt, "time", "          ")
++        self._binary_array(sig, "intensity", "          ")
++        self._w('        </binaryDataArrayList>\n')
++        self._w('      </chromatogram>\n    </chromatogramList>\n')
++
++    def _index(self):
++        self._w('<indexList count="2">\n')
++        self._w('  <index name="spectrum">\n')
++        for native, off in self.spec_offsets:
++            self._w('    <offset idRef="%s">%d</offset>\n' % (_esc(native), off))
++        self._w('  </index>\n  <index name="chromatogram">\n')
++        for native, off in self.chrom_offsets:
++            self._w('    <offset idRef="%s">%d</offset>\n' % (_esc(native), off))
++        self._w('  </index>\n</indexList>\n')
+diff --git a/ingest/ingest.py b/ingest/ingest.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/ingest.py
+@@ -0,0 +1,270 @@
++#!/usr/bin/env python3
++"""Ingest the Agilent GC/MS ``.d`` datasets in this workspace into open formats.
++
++Default output layout (under ``ingested/``)::
++
++    manifest.json                     everything known about every run
++    samples.csv                       one row per run (spreadsheet friendly)
++    method/<method>.acqmeth.txt       decoded instrument method printout
++    data/<sample>/tic.csv             RT, TIC, base peak, peak count per scan
++    data/<sample>/avg_spectrum.csv    summed spectrum at 0.1 u
++    data/<sample>/avg_spectrum_unit.csv   summed spectrum at 1 u
++    mzml/<sample>.mzML                full centroid data (with --mzml)
++
++Usage::
++
++    python3 ingest/ingest.py                # metadata + chromatograms
++    python3 ingest/ingest.py --mzml         # also export mzML
++    python3 ingest/ingest.py --only run1 run2   # restrict to named runs
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import json
++import os
++import shutil
++import sys
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from agilent_d import (AgilentDotD, ION_MODES, ION_POLARITY, SCAN_TYPES,
++                       find_datasets)
++
++WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++SAMPLE_COLUMNS = [
++    "sample", "dataset_dir", "vial", "sample_type", "acquired_time",
++    "instrument", "ms_model", "ms_serial", "ms_firmware", "acq_software",
++    "method", "tune_file", "tune_datetime", "ion_source", "ion_mode",
++    "polarity", "scan_type", "ms_level", "mz_low", "mz_high", "mz_step",
++    "gain", "scan_time_ms", "threshold", "data_storage",
++    "solvent_delay_min", "rt_start_min", "rt_end_min", "n_scans",
++    "median_scan_period_s", "total_tic", "max_tic", "max_tic_rt_min",
++    "global_base_peak_mz", "n_centroids", "inj_volume_ul", "dilution",
++    "original_path",
++]
++
++
++def _f(value, default=None):
++    try:
++        return float(value)
++    except (TypeError, ValueError):
++        return default
++
++
++def _first_scan_element(ds):
++    for seg in ds.ms_method.get("timeSegments") or []:
++        for ss in seg.get("scanSegments") or []:
++            for se in ss.get("scanElements") or []:
++                return ss, se
++    return {}, {}
++
++
++def summarize(ds: AgilentDotD) -> dict:
++    scans = ds.scans
++    dev = ds.ms_device
++    ss, se = _first_scan_element(ds)
++
++    rts = [s.scan_time for s in scans]
++    tics = [s.tic for s in scans]
++    total_tic = sum(tics)
++    max_tic = max(tics) if tics else 0.0
++    max_i = tics.index(max_tic) if tics else -1
++    periods = sorted((rts[i + 1] - rts[i]) * 60.0 for i in range(len(rts) - 1))
++    median_period = periods[len(periods) // 2] if periods else None
++    top = max(scans, key=lambda s: s.base_peak_value) if scans else None
++    first = scans[0] if scans else None
++
++    seg = (ds.time_segments or [{}])[0]
++
++    return {
++        "sample": ds.sample_name,
++        "dataset_dir": os.path.basename(ds.path),
++        "vial": ds.sample_info.get("Sample Position", ""),
++        "sample_type": ds.sample_info.get("Sample Type", ""),
++        "acquired_time": ds.acquired_time,
++        "instrument": ds.instrument,
++        "ms_model": dev.get("ModelNumber", ""),
++        "ms_serial": dev.get("SerialNumber", ""),
++        "ms_firmware": dev.get("FirmwareVersion", ""),
++        "acq_software": ds.contents.get("AcqSoftwareVersion", ""),
++        "method": ds.method_name,
++        "tune_file": ds.sample_info.get("调谐文件") or ds.ms_method.get("tuneFile", ""),
++        "tune_datetime": ds.sample_info.get("调谐日期时间", ""),
++        "ion_source": ds.ms_method.get("ionSource", ""),
++        "ion_mode": ION_MODES.get(first.ion_mode, first.ion_mode) if first else "",
++        "polarity": ION_POLARITY.get(first.ion_polarity, first.ion_polarity) if first else "",
++        "scan_type": ss.get("scanType") or (SCAN_TYPES.get(first.scan_type) if first else ""),
++        "ms_level": first.ms_level if first else "",
++        "mz_low": se.get("ms1LowMz", ""),
++        "mz_high": se.get("ms1HighMz", ""),
++        "mz_step": se.get("ms1Stepsize", ""),
++        "gain": se.get("gain", ""),
++        "scan_time_ms": ss.get("scanTime", ""),
++        "threshold": ss.get("threshold", ""),
++        "data_storage": ss.get("dataStorage", ""),
++        "solvent_delay_min": ds.ms_method.get("solventDelay", ""),
++        "rt_start_min": round(rts[0], 5) if rts else "",
++        "rt_end_min": round(rts[-1], 5) if rts else "",
++        "n_scans": len(scans),
++        "median_scan_period_s": round(median_period, 4) if median_period else "",
++        "total_tic": round(total_tic, 1),
++        "max_tic": round(max_tic, 1),
++        "max_tic_rt_min": round(rts[max_i], 5) if max_i >= 0 else "",
++        "global_base_peak_mz": round(top.base_peak_mz, 3) if top else "",
++        "n_centroids": sum(s.point_count for s in scans),
++        "inj_volume_ul": ds.sample_info.get("Inj Vol (µl)", ""),
++        "dilution": ds.sample_info.get("Dilution", ""),
++        "original_path": ds.sample_info.get("Data File", ""),
++        "declared_scans_mstsxml": seg.get("NumOfScans", ""),
++    }
++
++
++def write_tic(ds: AgilentDotD, path: str) -> None:
++    with open(path, "w", newline="", encoding="utf-8") as fh:
++        w = csv.writer(fh)
++        w.writerow(["scan_id", "rt_min", "tic", "base_peak_mz",
++                    "base_peak_intensity", "n_centroids", "lowest_mz",
++                    "highest_mz"])
++        for s in ds.scans:
++            w.writerow([s.scan_id, "%.6f" % s.scan_time, "%.1f" % s.tic,
++                        "%.3f" % s.base_peak_mz, "%.1f" % s.base_peak_value,
++                        s.point_count,
++                        "%.3f" % s.min_x if s.point_count else "",
++                        "%.3f" % s.max_x if s.point_count else ""])
++
++
++def _strip_d(name: str) -> str:
++    return name[:-2] if name.lower().endswith(".d") else name
++
++
++def write_avg_spectrum(rows, path: str) -> None:
++    base = max((r[1] for r in rows), default=0.0)
++    with open(path, "w", newline="", encoding="utf-8") as fh:
++        w = csv.writer(fh)
++        w.writerow(["mz", "summed_intensity", "relative_pct", "n_scans"])
++        for mz, inten, n in rows:
++            w.writerow(["%.4f" % mz, "%.1f" % inten,
++                        "%.4f" % (100.0 * inten / base) if base else "0",
++                        n])
++
++
++def rebin_unit(rows):
++    acc = {}
++    for mz, inten, n in rows:
++        key = int(round(mz))
++        slot = acc.setdefault(key, [0.0, 0])
++        slot[0] += inten
++        slot[1] += n
++    return [(float(k), v[0], v[1]) for k, v in sorted(acc.items())]
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(description=__doc__,
++                                formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--source", default=WORKSPACE,
++                    help="directory to scan for .d datasets (default: workspace)")
++    ap.add_argument("--out", default=os.path.join(WORKSPACE, "ingested"),
++                    help="output directory (default: <workspace>/ingested)")
++    ap.add_argument("--mzml", action="store_true",
++                    help="also export full centroid data as indexed mzML")
++    ap.add_argument("--no-compress", action="store_true",
++                    help="write mzML binary arrays uncompressed")
++    ap.add_argument("--only", nargs="*", metavar="NAME",
++                    help="restrict to these sample/dataset names")
++    args = ap.parse_args(argv)
++
++    datasets = find_datasets(args.source)
++    if args.only:
++        want = {_strip_d(n).lower() for n in args.only}
++        datasets = [d for d in datasets
++                    if _strip_d(os.path.basename(d)).lower() in want]
++    if not datasets:
++        print("no .d datasets found under %s" % args.source, file=sys.stderr)
++        return 1
++
++    out = args.out
++    data_dir = os.path.join(out, "data")
++    method_dir = os.path.join(out, "method")
++    mzml_dir = os.path.join(out, "mzml")
++    for d in (out, data_dir, method_dir):
++        os.makedirs(d, exist_ok=True)
++    if args.mzml:
++        os.makedirs(mzml_dir, exist_ok=True)
++
++    summaries = []
++    methods_written = set()
++    t0 = time.time()
++
++    for path in datasets:
++        with AgilentDotD(path) as ds:
++            info = summarize(ds)
++            label = _strip_d(info["dataset_dir"]) or ds.sample_name
++            sdir = os.path.join(data_dir, label)
++            os.makedirs(sdir, exist_ok=True)
++
++            write_tic(ds, os.path.join(sdir, "tic.csv"))
++            rows = ds.average_spectrum(decimals=1)
++            write_avg_spectrum(rows, os.path.join(sdir, "avg_spectrum.csv"))
++            write_avg_spectrum(rebin_unit(rows),
++                               os.path.join(sdir, "avg_spectrum_unit.csv"))
++
++            mname = ds.method_name or "method"
++            if mname not in methods_written:
++                text = ds.method_text()
++                if text:
++                    with open(os.path.join(method_dir, mname + ".acqmeth.txt"),
++                              "w", encoding="utf-8") as fh:
++                        fh.write(text)
++                if ds.method_dir:
++                    dest = os.path.join(method_dir, mname)
++                    if not os.path.exists(dest):
++                        shutil.copytree(ds.method_dir, dest)
++                methods_written.add(mname)
++
++            info["outputs"] = {
++                "tic": os.path.relpath(os.path.join(sdir, "tic.csv"), out),
++                "avg_spectrum": os.path.relpath(
++                    os.path.join(sdir, "avg_spectrum.csv"), out),
++                "avg_spectrum_unit": os.path.relpath(
++                    os.path.join(sdir, "avg_spectrum_unit.csv"), out),
++            }
++
++            if args.mzml:
++                target = os.path.join(mzml_dir, label + ".mzML")
++                ds.write_mzml(target, compress=not args.no_compress)
++                info["outputs"]["mzml"] = os.path.relpath(target, out)
++
++            summaries.append(info)
++            print("  %-8s %5d scans  %8.3f-%.3f min  TIC max %.3g @ %s min%s"
++                  % (label, info["n_scans"], info["rt_start_min"] or 0,
++                     info["rt_end_min"] or 0, info["max_tic"],
++                     info["max_tic_rt_min"],
++                     "  -> mzML" if args.mzml else ""))
++
++    manifest = {
++        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
++        "source": os.path.abspath(args.source),
++        "n_datasets": len(summaries),
++        "reader": "ingest/agilent_d.py (MSScan.bin + MSPeak.bin, stdlib only)",
++        "samples": summaries,
++    }
++    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
++        json.dump(manifest, fh, indent=2, ensure_ascii=False)
++
++    with open(os.path.join(out, "samples.csv"), "w", newline="",
++              encoding="utf-8") as fh:
++        w = csv.DictWriter(fh, fieldnames=SAMPLE_COLUMNS, extrasaction="ignore")
++        w.writeheader()
++        for s in summaries:
++            w.writerow(s)
++
++    print("\n%d dataset(s) ingested into %s in %.1fs"
++          % (len(summaries), out, time.time() - t0))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/ingest/plot.py b/ingest/plot.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/plot.py
+@@ -0,0 +1,382 @@
++#!/usr/bin/env python3
++"""Plot the ingested chromatograms and averaged spectra to PNG.
++
++Reads ``ingested/data/<run>/{tic,avg_spectrum,avg_spectrum_unit}.csv`` and
++writes to ``ingested/plots/``::
++
++    tic_grid.png                    all runs, shared axes
++    tic_overlay.png                 all runs overlaid, normalised
++    tic/<run>.png                   one run, strongest peaks labelled
++    avg_spectrum/<run>.png          summed spectrum at 0.1 u
++    avg_spectrum_unit/<run>.png     summed spectrum at 1 u
++    avg_spectrum_unit_grid.png      all runs at 1 u
++
++Usage::
++
++    python3 ingest/plot.py                 # everything
++    python3 ingest/plot.py --only run1 run2   # selected runs
++    python3 ingest/plot.py --logy          # log intensity axis on the spectra
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import os
++import sys
++
++import matplotlib
++matplotlib.use("Agg")
++
++import matplotlib.pyplot as plt
++import numpy as np
++
++WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++DEFAULT_IN = os.path.join(WORKSPACE, "ingested")
++
++LINE_KW = dict(linewidth=0.7, color="#1f4e79")
++
++
++def _sort_key(name: str):
++    """Runs named STD (a calibration standard) sort first, then purely numeric
++    names in numeric order, then everything else by trailing number."""
++    if name.upper() == "STD":
++        return (0, 0, name)
++    if name.isdigit():
++        return (1, int(name), name)
++    digits = "".join(c for c in name if c.isdigit())
++    return (2, int(digits) if digits else 0, name)
++
++
++def read_columns(path: str, columns):
++    """Read the named float columns of a CSV into numpy arrays."""
++    with open(path, newline="", encoding="utf-8") as fh:
++        reader = csv.DictReader(fh)
++        acc = {c: [] for c in columns}
++        for row in reader:
++            for c in columns:
++                acc[c].append(float(row[c]) if row[c] not in ("", None) else np.nan)
++    return {c: np.asarray(v, dtype=float) for c, v in acc.items()}
++
++
++def find_peaks(x, y, min_rel=0.02, min_sep=0.05, limit=12):
++    """Local maxima above *min_rel* of the max, separated by *min_sep* in x."""
++    if len(y) < 3:
++        return []
++    interior = np.arange(1, len(y) - 1)
++    cand = interior[(y[1:-1] >= y[:-2]) & (y[1:-1] > y[2:])]
++    cand = cand[y[cand] >= min_rel * y.max()]
++    cand = cand[np.argsort(y[cand])[::-1]]
++    picked = []
++    for i in cand:
++        if all(abs(x[i] - x[j]) >= min_sep for j in picked):
++            picked.append(i)
++        if len(picked) >= limit:
++            break
++    return sorted(picked, key=lambda i: x[i])
++
++
++def _tidy(ax):
++    ax.spines["top"].set_visible(False)
++    ax.spines["right"].set_visible(False)
++    ax.margins(x=0.01)
++
++
++# --------------------------------------------------------------------------
++# TIC
++# --------------------------------------------------------------------------
++
++def plot_tic(run, data, out_path, dpi):
++    rt, tic = data["rt_min"], data["tic"]
++    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.6), sharex=True)
++
++    ax1.plot(rt, tic, **LINE_KW)
++    for i in find_peaks(rt, tic, min_rel=0.05, min_sep=0.12, limit=12):
++        ax1.annotate("%.2f" % rt[i], (rt[i], tic[i]),
++                     textcoords="offset points", xytext=(0, 4), ha="center",
++                     fontsize=6.5, color="#b03030")
++    ax1.set_ylabel("total ion current")
++    ax1.set_ylim(bottom=0)
++    ax1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
++    ax1.set_title("linear scale - peaks >5% of base peak labelled",
++                  fontsize=9, loc="left")
++    _tidy(ax1)
++
++    pos = tic[tic > 0]
++    floor = max(pos.min(), np.percentile(pos, 2) / 5.0) if pos.size else 1.0
++    ax2.plot(rt, np.clip(tic, floor, None), **LINE_KW)
++    ax2.set_yscale("log")
++    ax2.set_ylim(floor, tic.max() * 3)
++    for i in find_peaks(rt, tic, min_rel=0.004, min_sep=0.3, limit=18):
++        ax2.annotate("%.2f" % rt[i], (rt[i], tic[i]),
++                     textcoords="offset points", xytext=(0, 4), ha="center",
++                     fontsize=6, color="#b03030")
++    ax2.set_xlabel("retention time (min)")
++    ax2.set_ylabel("total ion current (log)")
++    ax2.set_title("log scale - reveals the minor peaks compressed above",
++                  fontsize=9, loc="left")
++    _tidy(ax2)
++
++    fig.suptitle("TIC - %s  (%d scans, %.2f-%.2f min)"
++                 % (run, len(rt), rt[0], rt[-1]), fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.97))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++def plot_tic_grid(runs, tics, out_path, dpi):
++    n = len(runs)
++    ncols = 3 if n > 4 else max(1, n)
++    nrows = -(-n // ncols)
++    fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 2.5 * nrows),
++                             sharex=True, squeeze=False)
++    ymax = max(t["tic"].max() for t in tics.values())
++    for ax, run in zip(axes.ravel(), runs):
++        d = tics[run]
++        ax.plot(d["rt_min"], d["tic"], **LINE_KW)
++        ax.set_title(run, fontsize=9)
++        ax.set_ylim(0, ymax * 1.05)
++        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
++        ax.tick_params(labelsize=7)
++        ax.yaxis.get_offset_text().set_fontsize(6)
++        _tidy(ax)
++    for ax in axes.ravel()[len(runs):]:
++        ax.axis("off")
++    for ax in axes[-1]:
++        ax.set_xlabel("retention time (min)", fontsize=8)
++    for row in axes:
++        row[0].set_ylabel("TIC", fontsize=8)
++    fig.suptitle("TIC - all runs (common intensity scale)", fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.97))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++def plot_tic_overlay(runs, tics, out_path, dpi):
++    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
++    cmap = plt.get_cmap("turbo")
++    colors = [cmap(i / max(1, len(runs) - 1)) for i in range(len(runs))]
++
++    for run, c in zip(runs, colors):
++        d = tics[run]
++        ax1.plot(d["rt_min"], d["tic"], linewidth=0.6, color=c, label=run,
++                 alpha=0.85)
++    ax1.set_ylabel("total ion current")
++    ax1.set_ylim(bottom=0)
++    ax1.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
++    ax1.legend(ncol=len(runs), fontsize=7, frameon=False, loc="upper right")
++    ax1.set_title("TIC overlay - absolute intensity", fontsize=10)
++    _tidy(ax1)
++
++    for k, (run, c) in enumerate(zip(runs, colors)):
++        d = tics[run]
++        y = d["tic"] / d["tic"].max()
++        ax2.plot(d["rt_min"], y + k, linewidth=0.6, color=c)
++        ax2.text(d["rt_min"][0] - 0.15, k + 0.35, run, fontsize=7, ha="right",
++                 va="center", color=c)
++    ax2.set_yticks([])
++    ax2.set_xlabel("retention time (min)")
++    ax2.set_ylabel("normalised TIC (offset per run)")
++    ax2.set_title("TIC stack - each run scaled to its own base peak",
++                  fontsize=10)
++    ax2.set_xlim(left=tics[runs[0]]["rt_min"][0] - 1.2)
++    _tidy(ax2)
++
++    fig.tight_layout()
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++# --------------------------------------------------------------------------
++# spectra
++# --------------------------------------------------------------------------
++
++def plot_spectrum(run, data, out_path, dpi, kind, logy=False, n_labels=15):
++    mz, rel = data["mz"], data["relative_pct"]
++    step = "1 u" if kind == "unit" else "0.1 u"
++    min_gap = 7.0 if kind == "unit" else 2.5
++
++    def label(ax, n, gap, max_rel=None, lo=None, hi=None):
++        order = np.argsort(rel)[::-1]
++        chosen = []
++        for i in order:
++            if len(chosen) >= n:
++                break
++            if max_rel is not None and rel[i] >= max_rel:
++                continue
++            if lo is not None and not (lo <= mz[i] <= hi):
++                continue
++            if all(abs(mz[i] - mz[j]) >= gap for j in chosen):
++                chosen.append(i)
++        for i in chosen:
++            ax.annotate("%.4g" % mz[i], (mz[i], rel[i]),
++                        textcoords="offset points", xytext=(0, 3),
++                        ha="center", fontsize=6.5, color="#b03030")
++
++    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 6.6))
++
++    ax1.vlines(mz, 0, rel, linewidth=0.6, color="#1f4e79")
++    label(ax1, n_labels, min_gap)
++    ax1.set_ylabel("relative intensity (% of base peak)")
++    ax1.set_ylim(0, 105)
++    ax1.set_xlim(mz.min() - 5, mz.max() + 5)
++    ax1.set_xlabel("m/z")
++    ax1.set_title("full range, linear - strongest ions labelled", fontsize=9,
++                  loc="left")
++    _tidy(ax1)
++
++    if kind == "unit":
++        # 551 sticks: a log axis is readable and shows the trace-level ions.
++        keep = rel > 0.02
++        floor = 0.02
++        ax2.vlines(mz[keep], floor, rel[keep], linewidth=0.6, color="#1f4e79")
++        ax2.set_yscale("log")
++        ax2.set_ylim(floor, 400)
++        ax2.set_xlim(mz.min() - 5, mz.max() + 5)
++        label(ax2, 14, 10.0, max_rel=20.0)
++        ax2.set_ylabel("relative intensity (%, log)")
++        ax2.set_title("full range, log - strongest ions below 20% labelled "
++                      "(bins under 0.02% omitted)", fontsize=9, loc="left")
++    else:
++        # 5455 sticks would smear into a solid block; zoom instead so the
++        # 0.1 u granularity that this file carries is actually visible.
++        centre = mz[int(np.argmax(rel))]
++        lo, hi = centre - 12.0, centre + 12.0
++        keep = (mz >= lo) & (mz <= hi)
++        ax2.vlines(mz[keep], 0, rel[keep], linewidth=0.9, color="#1f4e79")
++        ax2.set_ylim(0, 105)
++        ax2.set_xlim(lo, hi)
++        label(ax2, 14, 0.45, lo=lo, hi=hi)
++        ax2.set_ylabel("relative intensity (%)")
++        ax2.set_title("zoom on the base peak, %.1f-%.1f u - shows the 0.1 u "
++                      "bin structure" % (lo, hi), fontsize=9, loc="left")
++    ax2.set_xlabel("m/z")
++    _tidy(ax2)
++
++    fig.suptitle("Summed spectrum, all scans, %s bins - %s   [%d bins]"
++                 % (step, run, len(mz)), fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.96))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++def plot_spectrum_grid(runs, specs, out_path, dpi, logy=False):
++    n = len(runs)
++    ncols = 3 if n > 4 else max(1, n)
++    nrows = -(-n // ncols)
++    fig, axes = plt.subplots(nrows, ncols, figsize=(4.6 * ncols, 2.5 * nrows),
++                             sharex=True, sharey=True, squeeze=False)
++    for ax, run in zip(axes.ravel(), runs):
++        d = specs[run]
++        ax.vlines(d["mz"], 0, d["relative_pct"], linewidth=0.5,
++                  color="#1f4e79")
++        top, gap = [], 12.0
++        for i in np.argsort(d["relative_pct"])[::-1]:
++            if len(top) >= 4:
++                break
++            if all(abs(d["mz"][i] - d["mz"][j]) >= gap for j in top):
++                top.append(i)
++        for i in top:
++            ax.annotate("%d" % round(d["mz"][i]),
++                        (d["mz"][i], d["relative_pct"][i]),
++                        textcoords="offset points", xytext=(0, 2),
++                        ha="center", fontsize=6, color="#b03030")
++        ax.set_title(run, fontsize=9)
++        ax.tick_params(labelsize=7)
++        if logy:
++            ax.set_yscale("log")
++            ax.set_ylim(1e-3, 200)
++        else:
++            ax.set_ylim(0, 110)
++        _tidy(ax)
++    for ax in axes.ravel()[len(runs):]:
++        ax.axis("off")
++    for ax in axes[-1]:
++        ax.set_xlabel("m/z", fontsize=8)
++    for row in axes:
++        row[0].set_ylabel("rel. int. (%)", fontsize=8)
++    fig.suptitle("Summed spectrum, 1 u bins - all runs", fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.97))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++# --------------------------------------------------------------------------
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--ingested", default=DEFAULT_IN,
++                    help="ingested/ directory (default: <workspace>/ingested)")
++    ap.add_argument("--out", default=None,
++                    help="plot directory (default: <ingested>/plots)")
++    ap.add_argument("--only", nargs="*", metavar="RUN",
++                    help="restrict to these run names")
++    ap.add_argument("--dpi", type=int, default=150)
++    ap.add_argument("--logy", action="store_true",
++                    help="log intensity axis on the multi-run spectrum grid "
++                         "(per-run figures always show linear + log)")
++    args = ap.parse_args(argv)
++
++    data_dir = os.path.join(args.ingested, "data")
++    if not os.path.isdir(data_dir):
++        print("no ingested data at %s - run ingest/ingest.py first" % data_dir,
++              file=sys.stderr)
++        return 1
++
++    runs = sorted((d for d in os.listdir(data_dir)
++                   if os.path.isdir(os.path.join(data_dir, d))), key=_sort_key)
++    if args.only:
++        want = {r.lower() for r in args.only}
++        runs = [r for r in runs if r.lower() in want]
++    if not runs:
++        print("no matching runs", file=sys.stderr)
++        return 1
++
++    out = args.out or os.path.join(args.ingested, "plots")
++    for sub in ("tic", "avg_spectrum", "avg_spectrum_unit"):
++        os.makedirs(os.path.join(out, sub), exist_ok=True)
++
++    tics, unit_specs = {}, {}
++    written = 0
++    for run in runs:
++        rd = os.path.join(data_dir, run)
++
++        tic = read_columns(os.path.join(rd, "tic.csv"), ["rt_min", "tic"])
++        tics[run] = tic
++        plot_tic(run, tic, os.path.join(out, "tic", run + ".png"), args.dpi)
++
++        fine = read_columns(os.path.join(rd, "avg_spectrum.csv"),
++                            ["mz", "relative_pct"])
++        plot_spectrum(run, fine,
++                      os.path.join(out, "avg_spectrum", run + ".png"),
++                      args.dpi, kind="fine", logy=args.logy)
++
++        unit = read_columns(os.path.join(rd, "avg_spectrum_unit.csv"),
++                            ["mz", "relative_pct"])
++        unit_specs[run] = unit
++        plot_spectrum(run, unit,
++                      os.path.join(out, "avg_spectrum_unit", run + ".png"),
++                      args.dpi, kind="unit", logy=args.logy)
++
++        written += 3
++        top = np.argsort(unit["relative_pct"])[::-1][:5]
++        print("  %-5s TIC max %.3g @ %.2f min | top m/z %s"
++              % (run, tic["tic"].max(),
++                 tic["rt_min"][int(np.argmax(tic["tic"]))],
++                 ", ".join("%d" % round(unit["mz"][i]) for i in top)))
++
++    plot_tic_grid(runs, tics, os.path.join(out, "tic_grid.png"), args.dpi)
++    plot_tic_overlay(runs, tics, os.path.join(out, "tic_overlay.png"), args.dpi)
++    plot_spectrum_grid(runs, unit_specs,
++                       os.path.join(out, "avg_spectrum_unit_grid.png"),
++                       args.dpi, logy=args.logy)
++    written += 3
++
++    print("\n%d PNG files written to %s" % (written, out))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/ingest/eic.py b/ingest/eic.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/eic.py
+@@ -0,0 +1,378 @@
++#!/usr/bin/env python3
++"""Extract ion chromatograms (EICs) from the Agilent ``.d`` runs.
++
++For each requested target m/z, every centroid within +/- ``--tol`` is summed
++per scan, giving one trace per ion per run.  Output under ``ingested/eic/``::
++
++    <run>.csv               rt_min, tic, eic_<mz> ... (one column per ion)
++    peaks.csv               detected peaks: run, mz, rt, height, area, width
++    plots/<run>.png         TIC plus every ion for that run
++    plots/mz<mz>.png        one ion compared across all runs
++
++Examples::
++
++    python3 ingest/eic.py                        # auto-pick the 6 top ions
++    python3 ingest/eic.py --mz 71 57 85 93 147   # explicit ions
++    python3 ingest/eic.py --mz 207 --tol 0.5 --rt 10 16
++    python3 ingest/eic.py --only run1 --mz 93 --verify
++"""
++
++from __future__ import annotations
++
++import argparse
++import csv
++import os
++import sys
++import time
++
++import matplotlib
++matplotlib.use("Agg")
++
++import matplotlib.pyplot as plt
++import numpy as np
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++from agilent_d import AgilentDotD, find_datasets
++
++WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++_TRAPZ = getattr(np, "trapezoid", None) or np.trapz
++
++
++def _sort_key(name: str):
++    """Runs named STD (a calibration standard) sort first, then purely numeric
++    names in numeric order, then everything else by trailing number."""
++    if name.upper() == "STD":
++        return (0, 0, name)
++    if name.isdigit():
++        return (1, int(name), name)
++    digits = "".join(c for c in name if c.isdigit())
++    return (2, int(digits) if digits else 0, name)
++
++
++def _strip_d(name: str) -> str:
++    return name[:-2] if name.lower().endswith(".d") else name
++
++
++def fmt_mz(mz: float) -> str:
++    return ("%g" % mz)
++
++
++# --------------------------------------------------------------------------
++# peak picking
++# --------------------------------------------------------------------------
++
++def detect_peaks(rt, sig, min_rel=0.02, max_peaks=8, min_sep=0.04):
++    """Local maxima with trapezoidal area over the surrounding valley."""
++    peaks = []
++    if sig.size < 3 or sig.max() <= 0:
++        return peaks
++    interior = np.arange(1, sig.size - 1)
++    cand = interior[(sig[1:-1] > sig[:-2]) & (sig[1:-1] >= sig[2:])]
++    cand = cand[sig[cand] >= min_rel * sig.max()]
++    cand = cand[np.argsort(sig[cand])[::-1]]
++
++    taken = []
++    for i in cand:
++        if len(taken) >= max_peaks:
++            break
++        if any(abs(rt[i] - rt[j]) < min_sep for j in taken):
++            continue
++        taken.append(i)
++
++        half = sig[i] * 0.05
++        left = i
++        while left > 0 and sig[left - 1] < sig[left] and sig[left] > half:
++            left -= 1
++        right = i
++        while right < sig.size - 1 and sig[right + 1] < sig[right] \
++                and sig[right] > half:
++            right += 1
++        seg = slice(left, right + 1)
++        area = float(_TRAPZ(sig[seg], rt[seg]))
++        peaks.append({"rt": float(rt[i]), "height": float(sig[i]),
++                      "area": area, "rt_start": float(rt[left]),
++                      "rt_end": float(rt[right]),
++                      "width_min": float(rt[right] - rt[left])})
++    return sorted(peaks, key=lambda p: p["rt"])
++
++
++# --------------------------------------------------------------------------
++# ion selection
++# --------------------------------------------------------------------------
++
++def auto_targets(ingested: str, runs, n: int):
++    """Top *n* unit-mass ions of the summed spectra of the selected runs."""
++    acc = {}
++    for run in runs:
++        path = os.path.join(ingested, "data", run, "avg_spectrum_unit.csv")
++        if not os.path.exists(path):
++            continue
++        with open(path, newline="", encoding="utf-8") as fh:
++            for row in csv.DictReader(fh):
++                mz = float(row["mz"])
++                acc[mz] = acc.get(mz, 0.0) + float(row["relative_pct"])
++    if not acc:
++        return []
++    top = sorted(acc.items(), key=lambda kv: kv[1], reverse=True)[:n]
++    return sorted(mz for mz, _ in top)
++
++
++# --------------------------------------------------------------------------
++# plotting
++# --------------------------------------------------------------------------
++
++def _spaced(peaks, n, min_gap):
++    """Up to *n* of the tallest peaks, no two closer than *min_gap* minutes.
++
++    Keeps the retention-time labels from printing on top of each other.
++    """
++    chosen = []
++    for p in sorted(peaks, key=lambda q: q["height"], reverse=True):
++        if len(chosen) >= n:
++            break
++        if all(abs(p["rt"] - q["rt"]) >= min_gap for q in chosen):
++            chosen.append(p)
++    return chosen
++
++
++def plot_run(run, rt, tic, targets, traces, out_path, dpi, peaks_by_ion):
++    n = len(targets)
++    fig, axes = plt.subplots(n + 1, 1, figsize=(11, 1.55 * (n + 1) + 1.1),
++                             sharex=True, squeeze=False)
++    axes = axes.ravel()
++    cmap = plt.get_cmap("tab10")
++
++    axes[0].plot(rt, tic, linewidth=0.7, color="#444444")
++    axes[0].set_ylabel("TIC", fontsize=8)
++    axes[0].set_title("TIC (reference)", fontsize=8, loc="left")
++
++    for k, t in enumerate(targets):
++        ax = axes[k + 1]
++        y = traces[k]
++        ax.plot(rt, y, linewidth=0.7, color=cmap(k % 10))
++        ax.fill_between(rt, 0, y, color=cmap(k % 10), alpha=0.18, linewidth=0)
++        for p in _spaced(peaks_by_ion[k], 6, 0.4):
++            ax.annotate("%.2f" % p["rt"], (p["rt"], p["height"]),
++                        textcoords="offset points", xytext=(0, 3),
++                        ha="center", fontsize=6, color="#b03030")
++        share = 100.0 * y.sum() / tic.sum() if tic.sum() else 0.0
++        ax.set_ylabel("m/z %s" % fmt_mz(t), fontsize=8)
++        ax.set_title("m/z %s  -  %.2f%% of the total ion current"
++                     % (fmt_mz(t), share), fontsize=8, loc="left")
++
++    for ax in axes:
++        ax.set_ylim(bottom=0)
++        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
++        ax.yaxis.get_offset_text().set_fontsize(6)
++        ax.tick_params(labelsize=7)
++        ax.spines["top"].set_visible(False)
++        ax.spines["right"].set_visible(False)
++        ax.margins(x=0.01)
++    axes[-1].set_xlabel("retention time (min)")
++    fig.suptitle("EIC - %s" % run, fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.98))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++def plot_ion_across_runs(target, runs, per_run, out_path, dpi):
++    n = len(runs)
++    fig, axes = plt.subplots(n, 1, figsize=(11, 1.25 * n + 1.2), sharex=True,
++                             squeeze=False)
++    axes = axes.ravel()
++    cmap = plt.get_cmap("turbo")
++    ymax = max(per_run[r][1].max() for r in runs) or 1.0
++
++    for k, run in enumerate(runs):
++        rt, y = per_run[run]
++        c = cmap(k / max(1, n - 1))
++        ax = axes[k]
++        ax.plot(rt, y, linewidth=0.7, color=c)
++        ax.fill_between(rt, 0, y, color=c, alpha=0.2, linewidth=0)
++        ax.set_ylim(0, ymax * 1.05)
++        ax.set_ylabel(run, fontsize=8, rotation=0, ha="right", va="center")
++        ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
++        ax.yaxis.get_offset_text().set_fontsize(6)
++        ax.tick_params(labelsize=7)
++        ax.spines["top"].set_visible(False)
++        ax.spines["right"].set_visible(False)
++        ax.margins(x=0.01)
++    axes[-1].set_xlabel("retention time (min)")
++    fig.suptitle("EIC m/z %s - all runs (common intensity scale)"
++                 % fmt_mz(target), fontsize=11)
++    fig.tight_layout(rect=(0, 0, 1, 0.98))
++    fig.savefig(out_path, dpi=dpi)
++    plt.close(fig)
++
++
++# --------------------------------------------------------------------------
++
++def verify(ds, targets, tol):
++    """Self-checks: a full-range EIC must reproduce the stored TIC exactly, the
++    vectorised extraction must agree with the pure-python one, and no EIC point
++    may exceed its scan's TIC."""
++    ok = True
++    tic = np.asarray([s.tic for s in ds.scans], dtype=float)
++
++    rt, full = ds.eic([325.0], tol=275.0)          # covers 50-600 entirely
++    dmax = float(np.abs(full[0] - tic).max())
++    print("    full-range EIC vs stored TIC: max |diff| = %.6g  (TIC max %.4g)"
++          % (dmax, tic.max()))
++    ok &= dmax == 0.0
++
++    t = targets[0]
++    lo, hi = ds.eic_window(t, tol)
++    _, fast = ds.eic([t], tol=tol)
++    slow = np.asarray(ds.xic(lo, hi)[1], dtype=float)
++    scale = max(slow.max(), 1.0)
++    d2 = float(np.abs(fast[0] - slow).max())
++    print("    m/z %s in [%.5f, %.5f]: vectorised vs pure-python "
++          "max |diff| = %.6g  (rel %.2g)" % (fmt_mz(t), lo, hi, d2, d2 / scale))
++    ok &= d2 / scale < 1e-12
++
++    over = int((fast[0] > tic + 1e-3).sum())
++    print("    scans where EIC > TIC: %d" % over)
++    ok &= over == 0
++
++    # the ion count inside the window must never exceed the peak count
++    npts = sum(1 for _ in ds.scans)
++    print("    scans covered: %d" % npts)
++    ok &= npts == len(tic)
++    return ok
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--source", default=WORKSPACE,
++                    help="directory holding the .d datasets")
++    ap.add_argument("--ingested", default=os.path.join(WORKSPACE, "ingested"))
++    ap.add_argument("--out", default=None,
++                    help="output directory (default: <ingested>/eic)")
++    ap.add_argument("--mz", nargs="+", type=float, metavar="MZ",
++                    help="target m/z values")
++    ap.add_argument("--auto", type=int, default=6, metavar="N",
++                    help="if --mz is absent, use the N most intense unit-mass "
++                         "ions (default 6)")
++    ap.add_argument("--tol", type=float, default=0.3,
++                    help="half-window in u around each target (default 0.3)")
++    ap.add_argument("--only", nargs="*", metavar="RUN",
++                    help="restrict to these runs")
++    ap.add_argument("--rt", nargs=2, type=float, metavar=("LO", "HI"),
++                    help="restrict output to this retention-time window")
++    ap.add_argument("--max-peaks", type=int, default=8)
++    ap.add_argument("--dpi", type=int, default=150)
++    ap.add_argument("--no-plots", action="store_true")
++    ap.add_argument("--verify", action="store_true",
++                    help="run extraction self-checks on the first run")
++    args = ap.parse_args(argv)
++
++    datasets = find_datasets(args.source)
++    if args.only:
++        want = {_strip_d(r).lower() for r in args.only}
++        datasets = [d for d in datasets
++                    if _strip_d(os.path.basename(d)).lower() in want]
++    if not datasets:
++        print("no .d datasets found under %s" % args.source, file=sys.stderr)
++        return 1
++    datasets.sort(key=lambda p: _sort_key(_strip_d(os.path.basename(p))))
++    runs = [_strip_d(os.path.basename(p)) for p in datasets]
++
++    targets = args.mz
++    if not targets:
++        targets = auto_targets(args.ingested, runs, args.auto)
++        if not targets:
++            print("could not auto-pick ions (no avg_spectrum_unit.csv); "
++                  "pass --mz", file=sys.stderr)
++            return 1
++        print("auto-selected ions: %s"
++              % ", ".join("m/z %s" % fmt_mz(t) for t in targets))
++    targets = sorted(float(t) for t in targets)
++
++    out = args.out or os.path.join(args.ingested, "eic")
++    plot_dir = os.path.join(out, "plots")
++    os.makedirs(out, exist_ok=True)
++    if not args.no_plots:
++        os.makedirs(plot_dir, exist_ok=True)
++
++    per_ion = {t: {} for t in targets}
++    peak_rows = []
++    t0 = time.time()
++
++    for path, run in zip(datasets, runs):
++        with AgilentDotD(path) as ds:
++            rt, traces = ds.eic(targets, tol=args.tol)
++            tic = np.asarray([s.tic for s in ds.scans], dtype=float)
++
++            if args.verify:
++                print("  %s self-checks:" % run)
++                if not verify(ds, targets, args.tol):
++                    print("    FAILED", file=sys.stderr)
++                    return 2
++                args.verify = False        # first run is enough
++
++            if args.rt:
++                m = (rt >= args.rt[0]) & (rt <= args.rt[1])
++                rt, traces, tic = rt[m], traces[:, m], tic[m]
++
++            csv_path = os.path.join(out, run + ".csv")
++            with open(csv_path, "w", newline="", encoding="utf-8") as fh:
++                w = csv.writer(fh)
++                w.writerow(["rt_min", "tic"]
++                           + ["eic_%s" % fmt_mz(t) for t in targets])
++                for j in range(rt.size):
++                    w.writerow(["%.6f" % rt[j], "%.1f" % tic[j]]
++                               + ["%.1f" % traces[k, j]
++                                  for k in range(len(targets))])
++
++            peaks_by_ion = []
++            for k, t in enumerate(targets):
++                pk = detect_peaks(rt, traces[k], max_peaks=args.max_peaks)
++                peaks_by_ion.append(pk)
++                for p in pk:
++                    peak_rows.append({
++                        "run": run, "mz": fmt_mz(t), "tol": args.tol,
++                        "rt_min": "%.4f" % p["rt"],
++                        "height": "%.1f" % p["height"],
++                        "area": "%.1f" % p["area"],
++                        "width_min": "%.4f" % p["width_min"],
++                        "rt_start": "%.4f" % p["rt_start"],
++                        "rt_end": "%.4f" % p["rt_end"],
++                        "pct_of_trace_max":
++                            "%.1f" % (100.0 * p["height"] / traces[k].max()
++                                      if traces[k].max() else 0.0)})
++                per_ion[t][run] = (rt, traces[k])
++
++            if not args.no_plots:
++                plot_run(run, rt, tic, targets, traces,
++                         os.path.join(plot_dir, run + ".png"), args.dpi,
++                         peaks_by_ion)
++
++            shares = ["m/z %s %.1f%%" % (fmt_mz(t),
++                      100.0 * traces[k].sum() / tic.sum() if tic.sum() else 0)
++                      for k, t in enumerate(targets)]
++            print("  %-5s %s" % (run, "  ".join(shares)))
++
++    if not args.no_plots:
++        for t in targets:
++            plot_ion_across_runs(t, runs, per_ion[t],
++                                 os.path.join(plot_dir,
++                                              "mz%s.png" % fmt_mz(t)),
++                                 args.dpi)
++
++    fields = ["run", "mz", "tol", "rt_min", "height", "area", "width_min",
++              "rt_start", "rt_end", "pct_of_trace_max"]
++    with open(os.path.join(out, "peaks.csv"), "w", newline="",
++              encoding="utf-8") as fh:
++        w = csv.DictWriter(fh, fieldnames=fields)
++        w.writeheader()
++        w.writerows(peak_rows)
++
++    print("\n%d ion(s) x %d run(s), %d peaks tabulated -> %s  (%.1fs)"
++          % (len(targets), len(runs), len(peak_rows), out, time.time() - t0))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/ingest/run_all.py b/ingest/run_all.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/run_all.py
+@@ -0,0 +1,137 @@
++#!/usr/bin/env python3
++"""One command to take a folder of Agilent MassHunter ``.d`` runs to results.
++
++Runs the three stages in order:
++
++  1. ingest  - metadata manifest, per-scan TIC, summed spectra, optional mzML
++  2. plot    - TIC and summed-spectrum figures
++  3. eic     - extracted ion chromatograms, peak table, comparison figures
++
++Everything lands under ``<workspace>/ingested/``.  Stages are independent
++scripts (``ingest.py``, ``plot.py``, ``eic.py``); this driver just wires them
++together with one set of options.
++
++Usage::
++
++    python3 ingest/run_all.py                     # full pipeline, no mzML
++    python3 ingest/run_all.py --mzml              # also export mzML (~45 MB/run)
++    python3 ingest/run_all.py --only run1 run2     # a subset of runs
++    python3 ingest/run_all.py --mz 93 107 --tol 0.3
++    python3 ingest/run_all.py --skip eic          # stop after the plots
++    python3 ingest/run_all.py --source /path/to/other/data --out /tmp/out
++"""
++
++from __future__ import annotations
++
++import argparse
++import os
++import sys
++import time
++
++sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
++
++import eic as eic_stage
++import ingest as ingest_stage
++import plot as plot_stage
++from agilent_d import find_datasets
++
++WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++STAGES = ("ingest", "plot", "eic")
++
++
++def _rule(title: str) -> None:
++    print("\n" + "=" * 72)
++    print(title)
++    print("=" * 72)
++
++
++def main(argv=None) -> int:
++    ap = argparse.ArgumentParser(
++        description=__doc__,
++        formatter_class=argparse.RawDescriptionHelpFormatter)
++    ap.add_argument("--source", default=WORKSPACE,
++                    help="directory to scan for .d datasets "
++                         "(default: the workspace root)")
++    ap.add_argument("--out", default=None,
++                    help="output directory (default: <workspace>/ingested)")
++    ap.add_argument("--only", nargs="*", metavar="RUN",
++                    help="restrict every stage to these run names")
++    ap.add_argument("--mzml", action="store_true",
++                    help="export full centroid data as indexed mzML")
++    ap.add_argument("--mz", nargs="+", type=float, metavar="MZ",
++                    help="EIC target m/z (default: 6 auto-picked ions)")
++    ap.add_argument("--tol", type=float, default=0.3,
++                    help="EIC half-window in u (default 0.3)")
++    ap.add_argument("--rt", nargs=2, type=float, metavar=("LO", "HI"),
++                    help="restrict the EIC output to this RT window")
++    ap.add_argument("--dpi", type=int, default=150)
++    ap.add_argument("--skip", nargs="*", default=[], choices=STAGES,
++                    metavar="STAGE",
++                    help="stages to skip: %s" % ", ".join(STAGES))
++    ap.add_argument("--no-plots", action="store_true",
++                    help="skip both figure stages (same as --skip plot eic "
++                         "for figures, EIC csv still written)")
++    ap.add_argument("--verify", action="store_true",
++                    help="run the EIC extraction self-checks")
++    args = ap.parse_args(argv)
++
++    out = args.out or os.path.join(WORKSPACE, "ingested")
++    datasets = find_datasets(args.source)
++    if not datasets:
++        print("no .d datasets found under %s" % args.source, file=sys.stderr)
++        return 1
++
++    print("source     : %s" % os.path.abspath(args.source))
++    print("output     : %s" % os.path.abspath(out))
++    print("datasets   : %d found%s"
++          % (len(datasets),
++             "" if not args.only else " (restricted to %s)" % " ".join(args.only)))
++    print("mzML export: %s" % ("yes" if args.mzml else "no"))
++
++    t0 = time.time()
++    common_only = (["--only"] + list(args.only)) if args.only else []
++
++    if "ingest" not in args.skip:
++        _rule("stage 1/3  ingest -- metadata, TIC, summed spectra%s"
++              % (", mzML" if args.mzml else ""))
++        argv1 = ["--source", args.source, "--out", out] + common_only
++        if args.mzml:
++            argv1.append("--mzml")
++        rc = ingest_stage.main(argv1)
++        if rc:
++            return rc
++
++    if "plot" not in args.skip and not args.no_plots:
++        _rule("stage 2/3  plot -- TIC and summed-spectrum figures")
++        rc = plot_stage.main(["--ingested", out, "--dpi", str(args.dpi)]
++                             + common_only)
++        if rc:
++            return rc
++
++    if "eic" not in args.skip:
++        _rule("stage 3/3  eic -- extracted ion chromatograms")
++        argv3 = ["--source", args.source, "--ingested", out,
++                 "--tol", str(args.tol), "--dpi", str(args.dpi)] + common_only
++        if args.mz:
++            argv3 += ["--mz"] + [repr(m) for m in args.mz]
++        if args.rt:
++            argv3 += ["--rt", str(args.rt[0]), str(args.rt[1])]
++        if args.no_plots:
++            argv3.append("--no-plots")
++        if args.verify:
++            argv3.append("--verify")
++        rc = eic_stage.main(argv3)
++        if rc:
++            return rc
++
++    _rule("done in %.1fs" % (time.time() - t0))
++    for rel in ("manifest.json", "samples.csv", "data", "method", "mzml",
++                "plots", "eic"):
++        p = os.path.join(out, rel)
++        if os.path.exists(p):
++            print("  %s" % p)
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/ingest/make_patch.py b/ingest/make_patch.py
+new file mode 100644
+--- /dev/null
++++ b/ingest/make_patch.py
+@@ -0,0 +1,113 @@
++#!/usr/bin/env python3
++"""Regenerate ``gcms-agilent-toolkit.patch`` from the tracked sources.
++
++The patch is a plain ``--- /dev/null`` unified diff, so it needs only
++``patch -p1`` to apply -- no git repository at the destination.
++
++Run after changing any file listed in :data:`FILES`::
++
++    python3 ingest/make_patch.py
++"""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import time
++
++ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++OUT = os.path.join(ROOT, "gcms-agilent-toolkit.patch")
++
++FILES = [
++    "ingest/agilent_d.py",
++    "ingest/ingest.py",
++    "ingest/plot.py",
++    "ingest/eic.py",
++    "ingest/run_all.py",
++    "ingest/make_patch.py",
++    "docs/agilent-d-format.md",
++    "docs/toolkit.md",
++]
++
++HEADER = """\
++Agilent MassHunter GC/MS .d toolkit -- portable patch
++=====================================================
++
++Recreates a self-contained toolkit that reads Agilent MassHunter `.d` datasets
++(MSScan.bin + MSPeak.bin) with no vendor software, and produces metadata
++manifests, chromatograms, summed spectra, extracted ion chromatograms and
++indexed mzML 1.1.0.
++
++Apply into any folder that contains `.d` directories:
++
++    cd /path/to/new/dataset/folder
++    patch -p1 < gcms-agilent-toolkit.patch
++    python3 ingest/run_all.py --mzml --verify
++
++`--verify` runs the extraction self-checks; they should report a max difference
++of exactly 0 against the TIC stored in the raw files.
++
++Contents
++    ingest/agilent_d.py       reader library: metadata, scans, spectra, EIC, mzML
++    ingest/ingest.py          stage 1: manifest, TIC, summed spectra, mzML
++    ingest/plot.py            stage 2: TIC and summed-spectrum figures
++    ingest/eic.py             stage 3: extracted ion chromatograms, peak table
++    ingest/run_all.py         all three stages under one set of options
++    ingest/make_patch.py      regenerates this patch
++    docs/agilent-d-format.md  binary layout reference and pitfalls
++    docs/toolkit.md           tool reference, output tree, validation, gotchas
++
++Requirements
++    python3      >= 3.8       reader is standard library only
++    numpy        optional     needed by eic.py and plot.py
++    matplotlib   optional     needed for the figures
++
++Nothing outside the target folder is touched, the source `.d` directories are
++only ever opened for reading, and output goes to `ingested/`.
++
++This patch carries code and documentation only -- no instrument data, no sample
++information, no local paths.
++
++Generated %(when)s -- %(nfiles)d files, %(nlines)d lines.
++%(sums)s
++--- 8< --- patch body below, do not edit --- 8< ---
++
++"""
++
++
++def build() -> str:
++    bodies, sums, total = [], [], 0
++    for rel in FILES:
++        with open(os.path.join(ROOT, rel), "rb") as fh:
++            raw = fh.read()
++        lines = raw.decode("utf-8").split("\n")
++        if lines and lines[-1] == "":
++            lines.pop()                 # trailing newline is not a line
++        total += len(lines)
++        sums.append("    %-26s %5d lines  sha256 %s"
++                    % (rel, len(lines), hashlib.sha256(raw).hexdigest()[:32]))
++        bodies.append("\n".join(
++            ["diff --git a/%s b/%s" % (rel, rel),
++             "new file mode 100644",
++             "--- /dev/null",
++             "+++ b/%s" % rel,
++             "@@ -0,0 +1,%d @@" % len(lines)]
++            + ["+" + line for line in lines]))
++
++    head = HEADER % {"when": time.strftime("%Y-%m-%d %H:%M:%S%z"),
++                     "nfiles": len(FILES), "nlines": total,
++                     "sums": "\n".join(sums)}
++    return head + "\n".join(bodies) + "\n"
++
++
++def main() -> int:
++    text = build()
++    with open(OUT, "w", encoding="utf-8", newline="\n") as fh:
++        fh.write(text)
++    print("wrote %s" % OUT)
++    print("  %d bytes, %d files" % (len(text.encode("utf-8")), len(FILES)))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/docs/agilent-d-format.md b/docs/agilent-d-format.md
+new file mode 100644
+--- /dev/null
++++ b/docs/agilent-d-format.md
+@@ -0,0 +1,186 @@
++# Agilent MassHunter `.d` binary layout (GC/MS, MSScan.bin + MSPeak.bin)
++
++Reverse-engineered and validated against every scan of a nine-run GC/MS
++sequence. Written for anyone who needs to read Agilent GC/MS data without
++MassHunter or the vendor .NET data-access DLLs.
++
++Layout observed on data written by MassHunter Acquisition 13.x from a
++triple-quadrupole GC/MS in single-quad (MS1 full scan) mode, centroid storage.
++It should be checked, not assumed, on other instrument and software
++combinations; the consistency tests at the end of this document are how to do
++that.
++
++Reference implementation: `ingest/agilent_d.py`.
++
++## Dataset tree
++
++```
++<run>.d/
++  acqmeth.txt                     human-readable method printout, UTF-16LE
++  sequence.log                    cumulative instrument sequence log
++  runstart.txt  GC.INI  ...       GC state at run start
++  AcqData/
++    Contents.xml                  acquisition time, software version, technique
++    Devices.xml                   MS model / serial / firmware
++    sample_info.xml               vial, injection volume, tune file, operator
++    sequence.xml                  the sequence row that produced this run
++    MSTS.xml                      time segments: start/end RT, scan count
++    MSScan.xsd                    field order of the MSScan.bin records
++    MSScan.bin                    fixed-size scan index records
++    MSPeak.bin                    centroid peak lists
++    <method>.m/                   full method copy incl. qqqacqmethod.xml
++    *.pdf                         tune and method reports
++```
++
++`MSScan.xsd` is the key: it declares the exact field sequence of a scan record.
++The binary is that sequence packed little-endian with no alignment padding.
++
++## MSScan.bin
++
++```
++offset 0x00   first bytes are 01 01 00 00 (format marker)
++offset 0x58   int32    byte offset where the record array starts (296 here)
++offset <that> record array, 184 bytes per scan, count = (filesize - start) / 184
++```
++
++Record layout (all little-endian, no padding). Offsets are within the record:
++
++| off | type   | field                      | example value           |
++|-----|--------|----------------------------|-------------------------|
++| 0   | int32  | ScanID                     | 1                       |
++| 4   | int32  | ScanMethodID               | 1                       |
++| 8   | int32  | TimeSegmentID              | 1                       |
++| 12  | double | ScanTime (minutes)         | 10.003183333333334      |
++| 20  | int32  | MSLevel                    | 1                       |
++| 24  | int32  | ScanType                   | 1 (Scan)                |
++| 28  | double | TIC                        | 165111.79136657715      |
++| 36  | double | BasePeakMZ                 | 595.0999755859375       |
++| 44  | double | BasePeakValue              | 5156.4619140625         |
++| 52  | int32  | CycleNumber                | 1                       |
++| 56  | int32  | Status                     | 0                       |
++| 60  | int32  | IonMode                    | 2 (EI)                  |
++| 64  | int32  | IonPolarity                | 0 (positive)            |
++| 68  | double | Fragmentor                 | 0.0                     |
++| 76  | double | CollisionEnergy            | 0.0                     |
++| 84  | double | MzOfInterest               | 0.0                     |
++| 92  | double | SamplingPeriod             | 0.0                     |
++| 100 | double | MeasuredMassRangeMin       | 50.0                    |
++| 108 | double | MeasuredMassRangeMax       | 600.0                   |
++| 116 | double | Threshold                  | 100.0                   |
++| 124 | int32  | IsFragmentorDynamic        | 0                       |
++| 128 | int32  | IsCollisionEnergyDynamic   | 0                       |
++| 132 | int32  | SpectrumFormatID           | 1                       |
++| 136 | int64  | SpectrumOffset             | 68                      |
++| 144 | int32  | ByteCount                  | 816                     |
++| 148 | int32  | PointCount                 | 102                     |
++| 152 | double | MinY (lowest abundance)    | 104.13257598876953      |
++| 160 | double | MaxY (highest abundance)   | 5156.4619140625         |
++| 168 | double | MinX (lowest m/z)          | 506.70001220703125      |
++| 176 | double | MaxX (highest m/z)         | 598.5                   |
++
++Total 184 bytes. The struct format string is
++`"<3i d 2i 3d 4i 7d 2i i q 2i 4d"`.
++
++Fields 0..128 are `ScanRecordType` from the XSD; fields 132..176 are one
++`SpectrumParamsType`. A record carries exactly one spectrum parameter block in
++this data. If a future dataset carries more, the record size will not be 184
++and the consistency check below will catch it.
++
++`IonMode` and `ScanType` are bit flags; the labels used by the reader are in
++`agilent_d.SCAN_TYPES` / `ION_MODES` / `ION_POLARITY`.
++
++## MSPeak.bin
++
++```
++offset 0x00   first bytes are 03 01 00 00 (format marker)
++offset 0x44   first peak block (matches SpectrumOffset of scan 1)
++```
++
++For each scan, at `SpectrumOffset`:
++
++```
++PointCount x float32    m/z, strictly ascending
++PointCount x float32    abundance
++```
++
++so `ByteCount == PointCount * 8`. Blocks are stored in scan order and pack
++tightly: the last block ends exactly at EOF.
++
++These are **centroids**, not profile data. This method used
++`dataStorage = PeakDetected` with `threshold = 100`, so only centroids at or
++above 100 counts were kept. That is why `MinX`/`MaxX` are much narrower than
++the 50-600 scan range in early scans, and why a scan may hold ~100 points at
++the solvent-delay boundary and ~500 mid-run.
++
++m/z values sit on the 0.1 u acquisition grid (`ms1Stepsize`), stored as
++float32. Values such as 82.9 and 96.9 are real: the centroid positions are not
++integers.
++
++## Reading it
++
++```python
++import sys; sys.path.insert(0, "ingest")
++from agilent_d import AgilentDotD
++
++with AgilentDotD("data/run1.d") as ds:
++    print(ds.sample_name, ds.instrument, ds.method_name, len(ds.scans))
++    rt, tic = ds.tic()                       # per-scan retention time and TIC
++    mz, ab = ds.spectrum(0)                  # centroids of the first scan
++    rt, traces = ds.eic([93, 107], tol=0.3)  # extracted ion chromatograms
++    ds.write_mzml("run1.mzML")               # indexed mzML 1.1.0
++```
++
++`AgilentDotD` is standard library only. `eic()` / `flat_peaks()` need numpy;
++`xic(mz_low, mz_high)` is the pure-python equivalent.
++
++## Validation
++
++Every check below was run over all 6268-6269 scans of all nine runs, not on a
++sample:
++
++| check | result |
++|-------|--------|
++| `sum(abundances) == TIC` stored in the record | exact, every scan |
++| `mz[argmax(ab)] == BasePeakMZ`, `max(ab) == BasePeakValue` | exact, every scan |
++| m/z array strictly ascending | holds, every scan |
++| `mz[0] == MinX`, `mz[-1] == MaxX` | exact, every scan |
++| `ByteCount == PointCount * 8` | holds, every scan |
++| last peak block ends at MSPeak.bin EOF | exact, all nine files |
++| record count vs `NumOfScans` in MSTS.xml | matches, all nine files |
++| first/last `ScanTime` vs MSTS.xml `StartTime`/`EndTime` | matches |
++
++The TIC identity is the strong one: it is an independent quantity stored in a
++different file from the peak lists, so reproducing it exactly for ~56,000 scans
++confirms the record stride, the peak-block offsets, the float32 interpretation
++and the m/z-then-abundance ordering all at once.
++
++## Pitfalls
++
++**Text encoding.** `acqmeth.txt`, `sequence.log` and `runstart.txt` are
++UTF-16LE with a BOM. Reading them as UTF-8 or a single-byte codec produces
++mojibake; on this instrument the labels are Chinese.
++`agilent_d.decode_text_file()` sniffs the BOM.
++
++**Do not assume the record array starts at 296.** Read the int32 at 0x58.
++`agilent_d._probe_data_offset()` is a fallback that locates the array by
++consistency check if that value is ever wrong.
++
++**Sample name is not the folder name.** `sample_info.xml` and `sequence.log`
++can disagree with the directory, and `sequence.log` can list a third set of
++names again, because that log is a cumulative record of the whole instrument
++sequence rather than of one output folder. Decide explicitly which of the three
++is authoritative for your purpose; this toolkit uses the folder name as the
++label and records the `sample_info.xml` name alongside it.
++
++**`sample_info.xml` keys.** Some `<Field>` entries have a numeric hash in
++`<Name>`; the only human-readable key is `<DisplayName>`, which is localised
++(on a non-English instrument it is not in English). The reader falls back to
++`DisplayName` when `Name` is all digits.
++
++**m/z window edges.** With a 0.1 u grid stored as float32, a request like
++`81 +/- 0.3` puts its edges exactly on the 80.7 and 81.3 grid points, where
++float rounding decides inclusion. Worse, NumPy's NEP-50 promotion casts a
++float64 bound down to float32 when compared against a float32 array, so a
++vectorised comparison silently includes points a pure-python one excludes.
++The reader widens both mass arrays to float64 and adds `EIC_EDGE = 1e-4` to
++each side so edge grid points are always included, deterministically.
+diff --git a/docs/toolkit.md b/docs/toolkit.md
+new file mode 100644
+--- /dev/null
++++ b/docs/toolkit.md
+@@ -0,0 +1,167 @@
++# `ingest/` toolkit reference
++
++Four tools plus a driver, reading Agilent MassHunter `.d` datasets directly.
++Binary layout is documented in [agilent-d-format.md](agilent-d-format.md).
++
++## Install
++
++Nothing to install if the files are present. To set the toolkit up in another
++dataset folder:
++
++```bash
++cd /path/to/new/dataset/folder
++patch -p1 < gcms-agilent-toolkit.patch
++python3 ingest/run_all.py --mzml --verify
++```
++
++Requirements: python3 >= 3.8. `agilent_d.py` is standard library only; numpy is
++needed for `eic.py` and `plot.py`, matplotlib for the figures.
++
++## Files
++
++| file | role |
++|------|------|
++| `ingest/agilent_d.py` | reader library: metadata, scans, spectra, EIC, mzML writer |
++| `ingest/ingest.py` | stage 1: manifest, per-scan TIC, summed spectra, mzML |
++| `ingest/plot.py` | stage 2: TIC and summed-spectrum figures |
++| `ingest/eic.py` | stage 3: extracted ion chromatograms, peak table, figures |
++| `ingest/run_all.py` | runs all three stages with one set of options |
++
++## One command
++
++```bash
++python3 ingest/run_all.py                 # metadata + figures + EIC, no mzML
++python3 ingest/run_all.py --mzml          # add mzML export (~45 MB per run)
++python3 ingest/run_all.py --only run1 run2   # a subset of runs
++python3 ingest/run_all.py --mz 93 107 --tol 0.3
++python3 ingest/run_all.py --skip eic      # stop after the figures
++python3 ingest/run_all.py --source /other/data --out /tmp/out --verify
++```
++
++`--verify` runs the EIC extraction self-checks (see Validation).
++
++## Output tree
++
++```
++ingested/
++  manifest.json                    40 metadata fields per run
++  samples.csv                      the same, one row per run
++  method/<method>.m/               verbatim copy of the acquisition method
++  method/<method>.acqmeth.txt      method printout decoded UTF-16LE -> UTF-8
++  data/<run>/tic.csv               per scan: RT, TIC, base peak, peak count, m/z range
++  data/<run>/avg_spectrum.csv      summed spectrum, 0.1 u bins
++  data/<run>/avg_spectrum_unit.csv summed spectrum, 1 u bins
++  mzml/<run>.mzML                  indexed mzML 1.1.0, all scans + TIC chromatogram
++  plots/tic_grid.png               all runs, common intensity scale
++  plots/tic_overlay.png            overlay plus normalised stack
++  plots/tic/<run>.png              linear and log panels, peak RTs labelled
++  plots/avg_spectrum/<run>.png     full range plus 24 u zoom on the base peak
++  plots/avg_spectrum_unit/<run>.png  full range linear and log
++  plots/avg_spectrum_unit_grid.png all runs at 1 u
++  eic/<run>.csv                    RT, TIC, one eic_<mz> column per ion
++  eic/peaks.csv                    run, mz, rt, height, area, width, boundaries
++  eic/plots/<run>.png              TIC plus every ion, stacked
++  eic/plots/mz<mz>.png             one ion across all runs, common scale
++```
++
++Rough sizes per run: CSV ~0.6 MB, figures ~0.4 MB, mzML ~45 MB.
++
++## Stage options worth knowing
++
++`ingest.py`
++- `--mzml` / `--no-compress` — mzML export, zlib-compressed float32 by default.
++- `--only NAME ...` — restrict runs; matches with or without the `.d` suffix.
++
++`plot.py`
++- `--logy` — log intensity on the multi-run spectrum grid. Per-run figures
++  always carry both a linear and a second panel.
++- `--dpi`, `--only`.
++
++`eic.py`
++- `--mz 71 57 85` — explicit targets. Without it, `--auto N` (default 6) picks
++  the N most intense unit-mass ions across the selected runs, so the choice
++  depends on which runs are included.
++- `--tol` — half-window in u, default 0.3. See the m/z edge note below.
++- `--rt LO HI` — restrict output and figures to a retention-time window.
++- `--max-peaks`, `--no-plots`, `--verify`.
++
++## Library use
++
++```python
++import sys; sys.path.insert(0, "ingest")
++from agilent_d import AgilentDotD, find_datasets
++
++for path in find_datasets("."):
++    with AgilentDotD(path) as ds:
++        print(ds.sample_name, ds.acquired_time, len(ds.scans))
++        rt, tic = ds.tic()
++        mz, ab = ds.spectrum(0)
++        rt, traces = ds.eic([71, 93], tol=0.3)     # needs numpy
++        rows = ds.average_spectrum(decimals=1, rt_range=(14.4, 14.9))
++        ds.write_mzml("/tmp/%s.mzML" % ds.name)
++```
++
++Useful members: `sample_info`, `contents`, `devices`, `time_segments`,
++`ms_method`, `method_text()`, `scans` (list of `ScanRecord`), `spectrum(i)`,
++`iter_spectra()`, `tic()`, `xic(lo, hi)`, `eic(targets, tol)`, `eic_window()`,
++`flat_peaks()`, `average_spectrum()`, `write_mzml()`.
++
++## Validation
++
++Run `--verify` to reproduce the EIC checks. The following were confirmed on
++every scan of every run of a nine-run validation sequence.
++
++Reader, every scan of every run:
++- decoded abundances sum to the stored `TIC` exactly
++- abundance argmax reproduces `BasePeakMZ` and `BasePeakValue` exactly
++- m/z arrays strictly ascending and equal to `MinX`/`MaxX` at the ends
++- last peak block ends exactly at `MSPeak.bin` EOF
++- scan count matches `MSTS.xml`
++
++mzML, every file:
++- validates against the official `mzML1.1.2_idx.xsd`
++- re-read with pymzML and compared back to the raw binaries: max |Δm/z| = 0,
++  max |ΔI| = 0, max |ΔRT| = 0
++- every index offset lands on a `<spectrum` byte; `fileChecksum` matches the
++  SHA-1 of the prefix
++
++EIC:
++- a single window spanning 50-600 reproduces the per-scan TIC with max
++  difference exactly 0
++- vectorised and pure-python extraction agree bit-for-bit
++- no EIC point exceeds its scan's TIC
++
++Portable patch: applies cleanly into an empty folder, restores all five sources
++byte-identically, and the full pipeline then runs with self-checks passing.
++
++## Gotchas
++
++**m/z window edges.** The mass axis is a 0.1 u grid stored as float32, so
++`81 +/- 0.3` lands its edges exactly on grid points. NumPy's NEP-50 promotion
++also casts a float64 bound down to float32 when compared against a float32
++array, which silently includes points a pure-python comparison excludes. The
++reader widens the arrays to float64 and adds `EIC_EDGE = 1e-4` per side. Ask
++for `--tol 0.3` and you get `[t-0.3001, t+0.3001]`, i.e. grid points at exactly
++`+/-0.3` are included.
++
++**Unit windows do not tile the grid.** Extracting all 551 unit masses at
++`--tol 0.45` leaves ~1.8e-4 of the signal out: nothing covers the `x.5` grid
++points. Verified that the residual equals the abundance on those points
++exactly. Use one wide window, not a sum of narrow ones, if you need closure.
++
++**mzML ids must not start with a digit.** A run whose folder name begins with a
++digit yields an `id` beginning with a digit, which fails the mzML NCName
++pattern. Names are sanitised
++(`_ncname()`), and the original sample name is carried in `sampleList`.
++
++**Auto-picked EIC ions depend on the run selection**, because they come from
++the summed spectra of the selected runs. Pass `--mz` for a fixed ion set when
++comparing across sessions.
++
++**Reported values in mzML cvParams round-trip exactly.** `%g`-style formatting
++was losing precision (20 microseconds on scan start time); values are written
++with `repr()`.
++
++**`ingested/` is regenerated, not merged.** Re-running a stage overwrites its
++outputs. `manifest.json` only lists an `mzml` output if that run was ingested
++with `--mzml` in the same invocation.
