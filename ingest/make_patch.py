@@ -22,6 +22,7 @@ FILES = [
     "ingest/agilent_d.py",
     "ingest/ingest.py",
     "ingest/plot.py",
+    "ingest/plot_r.R",
     "ingest/eic.py",
     "ingest/run_all.py",
     "ingest/make_patch.py",
@@ -51,6 +52,7 @@ Contents
     ingest/agilent_d.py       reader library: metadata, scans, spectra, EIC, mzML
     ingest/ingest.py          stage 1: manifest, TIC, summed spectra, mzML
     ingest/plot.py            stage 2: TIC and summed-spectrum figures
+    ingest/plot_r.R           optional R/ggplot2 plots from ingested CSVs
     ingest/eic.py             stage 3: extracted ion chromatograms, peak table
     ingest/run_all.py         all three stages under one set of options
     ingest/make_patch.py      regenerates this patch
@@ -61,6 +63,8 @@ Requirements
     python3      >= 3.8       reader is standard library only
     numpy        optional     needed by eic.py and plot.py
     matplotlib   optional     needed for the figures
+    R            optional     needed by ingest/plot_r.R
+    ggplot2      optional     installed by plot_r.R if missing
 
 Nothing outside the target folder is touched, the source `.d` directories are
 only ever opened for reading, and output goes to `ingested/`.

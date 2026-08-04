@@ -55,6 +55,21 @@ python3 ingest/run_all.py --source /data --out /tmp/out
 `--verify` runs the extraction self-checks on your own data and should report a
 maximum difference of exactly 0 against the TIC stored in the raw files.
 
+## R plotting
+
+After the Python ingestion has written `ingested/`, you can make ggplot2-based
+figures without re-reading the raw Agilent binaries:
+
+```bash
+Rscript ingest/plot_r.R
+Rscript ingest/plot_r.R --only STD s22 --dpi 300
+```
+
+The R script reads the same `ingested/data/<run>/` and optional
+`ingested/eic/` CSV files produced by `python3 ingest/run_all.py`, then writes
+PNG figures under `ingested/plots_r/`. It uses base R plus `ggplot2`; if
+`ggplot2` is missing, the script installs it from CRAN before plotting.
+
 ## What you get
 
 ```
@@ -152,6 +167,8 @@ which is fine for comparing runs and not a substitute for a real integrator.
 | Python | >= 3.8 |
 | numpy | optional — needed by `eic.py` and `plot.py` |
 | matplotlib | optional — needed for the figures |
+| R | optional — needed by `ingest/plot_r.R` |
+| ggplot2 | optional — installed by `plot_r.R` if missing |
 
 `agilent_d.py` on its own has no third-party dependencies.
 
@@ -161,6 +178,7 @@ which is fine for comparing runs and not a substitute for a real integrator.
 ingest/agilent_d.py   reader library and mzML writer
 ingest/ingest.py      stage 1: manifest, TIC, summed spectra, mzML
 ingest/plot.py        stage 2: TIC and summed-spectrum figures
+ingest/plot_r.R       optional R/ggplot2 plotting from ingested CSVs
 ingest/eic.py         stage 3: extracted ion chromatograms, peak table
 ingest/run_all.py     all three stages under one set of options
 ingest/make_patch.py  regenerates gcms-agilent-toolkit.patch
