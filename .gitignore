@@ -88,6 +88,7 @@ quant_results/
 # Real batch tables and analyte definitions name samples and concentrations.
 batch*.csv
 analytes*.json
+quant_config/
 # Templates carry no sample identity and stay in version control.
 !mrm_quant/templates/
 !mrm_quant/templates/*.csv

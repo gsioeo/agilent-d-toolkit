@@ -1,0 +1,8 @@
+run_id,dataset_path,batch_id,analyte_id,role,level_id,concentration,concentration_unit,concentration_basis,dilution_factor,internal_standard_id,internal_standard_concentration,include,exclusion_reason
+CAL_1,<batch-folder>/CAL_1.d,<batch-id>,<analyte-id>,calibration,S1,,,vial concentration prepared by serial dilution,1,,,true,
+CAL_2,<batch-folder>/CAL_2.d,<batch-id>,<analyte-id>,calibration,S2,,,vial concentration prepared by serial dilution,1,,,true,
+CAL_3,<batch-folder>/CAL_3.d,<batch-id>,<analyte-id>,calibration,S3,,,vial concentration prepared by serial dilution,1,,,true,
+BLANK,<batch-folder>/BLANK.d,<batch-id>,<analyte-id>,blank,,,,,1,,,true,
+QC_1,<batch-folder>/QC_1.d,<batch-id>,<analyte-id>,qc,,0.05,mg/mL,independently prepared control,1,,,true,
+SAMPLE_1,<batch-folder>/SAMPLE_1.d,<batch-id>,<analyte-id>,unknown,,,,,1,,,true,
+SAMPLE_2,<batch-folder>/SAMPLE_2.d,<batch-id>,<analyte-id>,unknown,,,,,1,,,false,injection aborted

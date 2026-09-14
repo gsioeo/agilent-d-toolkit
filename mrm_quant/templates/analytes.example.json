@@ -1,0 +1,59 @@
+{
+  "version": "v1",
+  "note": "Example only. Every value must be replaced with the one the method and the batch actually use. Run 'python3 -m mrm_quant inspect' first: channels.csv lists the acquired transitions and channel_response.csv ranks their response and gives a candidate retention time.",
+  "analytes": [
+    {
+      "analyte_id": "<analyte-id>",
+      "identity_confirmed": false,
+      "identity_note": "State how the identity was confirmed. An unconfirmed compound name from the acquisition method is not a confirmation.",
+      "expected_rt_min": 0.0,
+      "rt_tolerance_min": 0.05,
+      "search_margin_min": 0.25,
+      "quantifier": {
+        "precursor_mz": 0.0,
+        "product_mz": 0.0,
+        "collision_energy_ev": 0.0,
+        "polarity": 0,
+        "time_segment_id": 1,
+        "scan_method_id": 1,
+        "precursor_tol_da": 0.01,
+        "product_tol_da": 0.01,
+        "ce_tol_ev": 0.01,
+        "channel_label": "quantifier"
+      },
+      "qualifiers": [],
+      "integration": {
+        "baseline": "linear_endpoints",
+        "max_gap_min": null,
+        "min_relative_height": 0.05,
+        "min_absolute_height": null,
+        "boundary_fraction": 0.05,
+        "min_separation_min": 0.1,
+        "min_points": 3
+      },
+      "calibration": {
+        "weighting": "none",
+        "intercept": "free",
+        "concentration_unit": "mg/mL",
+        "series": {
+          "top_concentration": 1.0,
+          "dilution_step": 2.0,
+          "levels": 10,
+          "level_id_format": "S%d"
+        }
+      },
+      "response": {
+        "mode": "external",
+        "internal_standard_id": null
+      },
+      "qc": {
+        "blank_run_id": null,
+        "blank_limit_area": null,
+        "loq_concentration": null,
+        "qualifier_relative_tolerance": null,
+        "qualifier_rt_tolerance_min": null,
+        "qc_relative_tolerance": null
+      }
+    }
+  ]
+}
