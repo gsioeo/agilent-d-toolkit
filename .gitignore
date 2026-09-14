@@ -76,6 +76,7 @@ samples.csv
 # Kept locally: names the instrument, method, samples and findings.
 docs/session-summary.md
 docs/*-summary.md
+docs/mrm-quant-plan.zh-CN.md
 # Blog drafts stay local; publish them from the blog, not from here.
 docs/blog/
 notes/

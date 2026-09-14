@@ -2,7 +2,7 @@
 
 在已有 `ingest/` 之上新增的独立包：按方法实际采集的离子对（Q1/Q3/CE/极性/时间段/方法段）提取原生 MRM 通道，在目标保留时间窗口内积分，用同一批的标准拟合线性工作曲线，回算浓度并给出状态与追溯。二进制读取全部复用 `ingest/agilent_d.py`，本包按显式路径只读加载它，不修改也不复制它，也不接入 `run_all.py`。
 
-设计与验收依据见 [mrm-quant-plan.zh-CN.md](mrm-quant-plan.zh-CN.md)；`tests/test_future_contracts.py` 的 28 项契约即接口定义。
+设计与验收依据见本机的规划文档 `mrm_quant_plan/PLAN.zh-CN.md`（含仪器、方法与样品信息，不纳入版本控制）；`tests/test_future_contracts.py` 的 28 项契约即接口定义。
 
 ## 三条命令
 
