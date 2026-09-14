@@ -76,9 +76,24 @@ samples.csv
 # Kept locally: names the instrument, method, samples and findings.
 docs/session-summary.md
 docs/*-summary.md
+# Blog drafts stay local; publish them from the blog, not from here.
+docs/blog/
 notes/
 scratch/
 *.local.md
+
+# ---- mrm_quant results and real configurations ----------------------
+# Quantification output is reproducible from the raw data and the config.
+quant_results/
+# Real batch tables and analyte definitions name samples and concentrations.
+batch*.csv
+analytes*.json
+# Templates carry no sample identity and stay in version control.
+!mrm_quant/templates/
+!mrm_quant/templates/*.csv
+!mrm_quant/templates/*.json
+# Test fixtures are synthetic.
+!tests/*.json
 
 # ---- credentials and secrets ----------------------------------------
 .env
