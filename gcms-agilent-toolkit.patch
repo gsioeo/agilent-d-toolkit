@@ -39,7 +39,7 @@ only ever opened for reading, and output goes to `ingested/`.
 This patch carries code and documentation only -- no instrument data, no sample
 information, no local paths.
 
-Generated 2026-08-04 02:36:11-0400 -- 9 files, 3072 lines.
+Generated 2026-09-14 04:31:50-0400 -- 9 files, 3075 lines.
     ingest/agilent_d.py          820 lines  sha256 5b085e98827a0853ac9fb1f9faf6dd22
     ingest/ingest.py             270 lines  sha256 e3521909ab3618783cbf3c5668b9a837
     ingest/plot.py               382 lines  sha256 f45544479c80889699ca1119d063b211
@@ -48,7 +48,7 @@ Generated 2026-08-04 02:36:11-0400 -- 9 files, 3072 lines.
     ingest/run_all.py            137 lines  sha256 0c6652e31134df6cc317e475fe17b880
     ingest/make_patch.py         117 lines  sha256 e3f3a9f0782e4c887cf466239ce99046
     docs/agilent-d-format.md     186 lines  sha256 a2a8308f420105926c0115bfacd346c2
-    docs/toolkit.md              167 lines  sha256 d0307856352abcfd45a0b3ee810db303
+    docs/toolkit.md              170 lines  sha256 f264ab63eb97258530a92d25a5d16bf3
 --- 8< --- patch body below, do not edit --- 8< ---
 
 diff --git a/ingest/agilent_d.py b/ingest/agilent_d.py
@@ -3000,11 +3000,14 @@ diff --git a/docs/toolkit.md b/docs/toolkit.md
 new file mode 100644
 --- /dev/null
 +++ b/docs/toolkit.md
-@@ -0,0 +1,167 @@
+@@ -0,0 +1,170 @@
 +# `ingest/` toolkit reference
 +
 +Four tools plus a driver, reading Agilent MassHunter `.d` datasets directly.
 +Binary layout is documented in [agilent-d-format.md](agilent-d-format.md).
++MRM transition extraction and same-batch calibration quantification live in a
++separate package, documented in [mrm-quant.md](mrm-quant.md); it reuses this
++reader read-only and does not change anything below.
 +
 +## Install
 +

@@ -2,6 +2,9 @@
 
 Four tools plus a driver, reading Agilent MassHunter `.d` datasets directly.
 Binary layout is documented in [agilent-d-format.md](agilent-d-format.md).
+MRM transition extraction and same-batch calibration quantification live in a
+separate package, documented in [mrm-quant.md](mrm-quant.md); it reuses this
+reader read-only and does not change anything below.
 
 ## Install
 
