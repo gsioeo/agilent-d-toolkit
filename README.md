@@ -97,7 +97,11 @@ Two UTF-8 configuration files drive it; templates are in
 an explicit `role` (calibration / blank / qc / unknown), the level, the
 concentration and the dilution factor. `analytes.json` gives the transition, the
 retention-time window, the integration settings, the calibration model
-(`none`, `1/x` or `1/x2` weighting; free or zero intercept) and the QC limits.
+(`none`, `1/x` or `1/x2` weighting; free or zero intercept), response mode and
+the QC limits. External response uses the target area and records that no
+internal standard was used. Internal response names another analyte definition
+as `internal_standard_id`; its configured transition is measured in the same
+injection and the target-area/internal-standard-area ratio is calibrated.
 Concentrations may be written level by level, generated from a series
 (`top_concentration`, `dilution_step`, `levels`), or both — and then they must
 agree.
@@ -116,7 +120,8 @@ quant_results/quant_001/
 Only a clean result reports a concentration. Everything else keeps its
 diagnostic numbers and a status instead: `no_peak`, `ambiguous_peak`,
 `non_positive_area`, `negative_backcalc`, `below_calibration_range`,
-`above_calibration_range`, `below_validated_loq`, `ion_ratio_fail`,
+`above_calibration_range`, `below_validated_loq`, `calibration_failed`,
+`quantification_failed`, `internal_standard_failed`, `ion_ratio_fail`,
 `rt_mismatch`, `blank_contamination`, `qc_fail`. Nothing is extrapolated,
 clipped to zero or reported as ND. `validated` is true only when a blank limit
 and an independent QC were configured and passed; an absent check is reported as

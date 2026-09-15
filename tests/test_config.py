@@ -1,5 +1,6 @@
 """Configuration loading, validation and the concentration series."""
 import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -129,6 +130,21 @@ class AnalyteAndCrossCheckTests(unittest.TestCase):
         self.assertEqual(values, [1., 0.5, 0.25])
         self.assertEqual({item['concentration_source'] for item in loaded['batch']['rows']},
                          {'series'})
+
+    def test_internal_standard_must_reference_external_analyte(self):
+        analytes = copy.deepcopy(ANALYTE)
+        analytes['analytes'][0]['response'] = {
+            'mode': 'internal', 'internal_standard_id': 'IS'}
+        is_entry = copy.deepcopy(analytes['analytes'][0])
+        is_entry['analyte_id'] = 'IS'
+        is_entry['response'] = {'mode': 'external', 'internal_standard_id': None}
+        analytes['analytes'].append(is_entry)
+        loaded = self.configuration([row('CAL_1')], analytes=analytes)
+        self.assertEqual(loaded['analytes']['analytes']['A']['response']['mode'], 'internal')
+        bad = copy.deepcopy(analytes)
+        bad['analytes'][0]['response']['internal_standard_id'] = 'MISSING'
+        with self.assertRaisesRegex(ValueError, 'unknown_internal_standard'):
+            self.configuration([row('CAL_1')], analytes=bad)
         self.assertEqual({item['concentration_unit'] for item in loaded['batch']['rows']},
                          {'mg/mL'})
 

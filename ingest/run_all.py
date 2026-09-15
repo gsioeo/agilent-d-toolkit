@@ -34,6 +34,10 @@ import eic as eic_stage
 import ingest as ingest_stage
 import plot as plot_stage
 from agilent_d import find_datasets
+try:
+    from output import unique_dataset_basenames
+except ImportError:
+    from ingest.output import unique_dataset_basenames
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STAGES = ("ingest", "plot", "eic")
@@ -77,6 +81,7 @@ def main(argv=None) -> int:
 
     out = args.out or os.path.join(WORKSPACE, "ingested")
     datasets = find_datasets(args.source)
+    unique_dataset_basenames(datasets)
     if not datasets:
         print("no .d datasets found under %s" % args.source, file=sys.stderr)
         return 1

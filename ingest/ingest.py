@@ -31,6 +31,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agilent_d import (AgilentDotD, ION_MODES, ION_POLARITY, SCAN_TYPES,
                        find_datasets)
+try:
+    from output import (begin_output, commit_output, discard_output,
+                        unique_dataset_basenames)
+except ImportError:
+    from ingest.output import (begin_output, commit_output, discard_output,
+                               unique_dataset_basenames)
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -177,6 +183,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     datasets = find_datasets(args.source)
+    unique_dataset_basenames(datasets)
     if args.only:
         want = {_strip_d(n).lower() for n in args.only}
         datasets = [d for d in datasets
@@ -185,84 +192,91 @@ def main(argv=None) -> int:
         print("no .d datasets found under %s" % args.source, file=sys.stderr)
         return 1
 
-    out = args.out
+    requested_out = args.out
+    out = begin_output(requested_out)
     data_dir = os.path.join(out, "data")
     method_dir = os.path.join(out, "method")
     mzml_dir = os.path.join(out, "mzml")
-    for d in (out, data_dir, method_dir):
-        os.makedirs(d, exist_ok=True)
-    if args.mzml:
-        os.makedirs(mzml_dir, exist_ok=True)
+    try:
+        for d in (out, data_dir, method_dir):
+            os.makedirs(d, exist_ok=True)
+        if args.mzml:
+            os.makedirs(mzml_dir, exist_ok=True)
 
-    summaries = []
-    methods_written = set()
-    t0 = time.time()
+        summaries = []
+        methods_written = set()
+        t0 = time.time()
 
-    for path in datasets:
-        with AgilentDotD(path) as ds:
-            info = summarize(ds)
-            label = _strip_d(info["dataset_dir"]) or ds.sample_name
-            sdir = os.path.join(data_dir, label)
-            os.makedirs(sdir, exist_ok=True)
+        for path in datasets:
+            with AgilentDotD(path) as ds:
+                info = summarize(ds)
+                label = _strip_d(info["dataset_dir"]) or ds.sample_name
+                sdir = os.path.join(data_dir, label)
+                os.makedirs(sdir, exist_ok=True)
 
-            write_tic(ds, os.path.join(sdir, "tic.csv"))
-            rows = ds.average_spectrum(decimals=1)
-            write_avg_spectrum(rows, os.path.join(sdir, "avg_spectrum.csv"))
-            write_avg_spectrum(rebin_unit(rows),
-                               os.path.join(sdir, "avg_spectrum_unit.csv"))
+                write_tic(ds, os.path.join(sdir, "tic.csv"))
+                rows = ds.average_spectrum(decimals=1)
+                write_avg_spectrum(rows, os.path.join(sdir, "avg_spectrum.csv"))
+                write_avg_spectrum(rebin_unit(rows),
+                                   os.path.join(sdir, "avg_spectrum_unit.csv"))
 
-            mname = ds.method_name or "method"
-            if mname not in methods_written:
-                text = ds.method_text()
-                if text:
-                    with open(os.path.join(method_dir, mname + ".acqmeth.txt"),
-                              "w", encoding="utf-8") as fh:
-                        fh.write(text)
-                if ds.method_dir:
-                    dest = os.path.join(method_dir, mname)
-                    if not os.path.exists(dest):
-                        shutil.copytree(ds.method_dir, dest)
-                methods_written.add(mname)
+                mname = ds.method_name or "method"
+                if mname not in methods_written:
+                    text = ds.method_text()
+                    if text:
+                        with open(os.path.join(method_dir, mname + ".acqmeth.txt"),
+                                  "w", encoding="utf-8") as fh:
+                            fh.write(text)
+                    if ds.method_dir:
+                        dest = os.path.join(method_dir, mname)
+                        if not os.path.exists(dest):
+                            shutil.copytree(ds.method_dir, dest)
+                    methods_written.add(mname)
 
-            info["outputs"] = {
-                "tic": os.path.relpath(os.path.join(sdir, "tic.csv"), out),
-                "avg_spectrum": os.path.relpath(
-                    os.path.join(sdir, "avg_spectrum.csv"), out),
-                "avg_spectrum_unit": os.path.relpath(
-                    os.path.join(sdir, "avg_spectrum_unit.csv"), out),
-            }
+                info["outputs"] = {
+                    "tic": os.path.relpath(os.path.join(sdir, "tic.csv"), out),
+                    "avg_spectrum": os.path.relpath(
+                        os.path.join(sdir, "avg_spectrum.csv"), out),
+                    "avg_spectrum_unit": os.path.relpath(
+                        os.path.join(sdir, "avg_spectrum_unit.csv"), out),
+                }
 
-            if args.mzml:
-                target = os.path.join(mzml_dir, label + ".mzML")
-                ds.write_mzml(target, compress=not args.no_compress)
-                info["outputs"]["mzml"] = os.path.relpath(target, out)
+                if args.mzml:
+                    target = os.path.join(mzml_dir, label + ".mzML")
+                    ds.write_mzml(target, compress=not args.no_compress)
+                    info["outputs"]["mzml"] = os.path.relpath(target, out)
 
-            summaries.append(info)
-            print("  %-8s %5d scans  %8.3f-%.3f min  TIC max %.3g @ %s min%s"
+                summaries.append(info)
+                print("  %-8s %5d scans  %8.3f-%.3f min  TIC max %.3g @ %s min%s"
                   % (label, info["n_scans"], info["rt_start_min"] or 0,
                      info["rt_end_min"] or 0, info["max_tic"],
                      info["max_tic_rt_min"],
                      "  -> mzML" if args.mzml else ""))
 
-    manifest = {
-        "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "source": os.path.abspath(args.source),
-        "n_datasets": len(summaries),
-        "reader": "ingest/agilent_d.py (MSScan.bin + MSPeak.bin, stdlib only)",
-        "samples": summaries,
-    }
-    with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
-        json.dump(manifest, fh, indent=2, ensure_ascii=False)
+        manifest = {
+            "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "source": os.path.abspath(args.source),
+            "n_datasets": len(summaries),
+            "reader": "ingest/agilent_d.py (MSScan.bin + MSPeak.bin, stdlib only)",
+            "samples": summaries,
+        }
+        with open(os.path.join(out, "manifest.json"), "w", encoding="utf-8") as fh:
+            json.dump(manifest, fh, indent=2, ensure_ascii=False)
 
-    with open(os.path.join(out, "samples.csv"), "w", newline="",
-              encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=SAMPLE_COLUMNS, extrasaction="ignore")
-        w.writeheader()
-        for s in summaries:
-            w.writerow(s)
+        with open(os.path.join(out, "samples.csv"), "w", newline="",
+                  encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=SAMPLE_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            for s in summaries:
+                w.writerow(s)
+
+        commit_output(out, requested_out, group='ingest')
+    except Exception:
+        discard_output(out)
+        raise
 
     print("\n%d dataset(s) ingested into %s in %.1fs"
-          % (len(summaries), out, time.time() - t0))
+          % (len(summaries), requested_out, time.time() - t0))
     return 0
 
 

@@ -33,6 +33,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agilent_d import AgilentDotD, find_datasets
+try:
+    from output import begin_output, commit_output, discard_output, unique_dataset_basenames
+except ImportError:
+    from ingest.output import begin_output, commit_output, discard_output, unique_dataset_basenames
 
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _TRAPZ = getattr(np, "trapezoid", None) or np.trapz
@@ -241,7 +245,10 @@ def verify(ds, targets, tol):
     return ok
 
 
-def main(argv=None) -> int:
+_ACTIVE_STAGE = None
+
+
+def _main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -269,6 +276,7 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     datasets = find_datasets(args.source)
+    unique_dataset_basenames(datasets)
     if args.only:
         want = {_strip_d(r).lower() for r in args.only}
         datasets = [d for d in datasets
@@ -290,7 +298,10 @@ def main(argv=None) -> int:
               % ", ".join("m/z %s" % fmt_mz(t) for t in targets))
     targets = sorted(float(t) for t in targets)
 
-    out = args.out or os.path.join(args.ingested, "eic")
+    requested_out = args.out or os.path.join(args.ingested, "eic")
+    out = begin_output(requested_out)
+    global _ACTIVE_STAGE
+    _ACTIVE_STAGE = out
     plot_dir = os.path.join(out, "plots")
     os.makedirs(out, exist_ok=True)
     if not args.no_plots:
@@ -309,6 +320,7 @@ def main(argv=None) -> int:
                 print("  %s self-checks:" % run)
                 if not verify(ds, targets, args.tol):
                     print("    FAILED", file=sys.stderr)
+                    discard_output(out)
                     return 2
                 args.verify = False        # first run is enough
 
@@ -369,9 +381,24 @@ def main(argv=None) -> int:
         w.writeheader()
         w.writerows(peak_rows)
 
+    commit_output(out, requested_out, group='eic')
+
     print("\n%d ion(s) x %d run(s), %d peaks tabulated -> %s  (%.1fs)"
-          % (len(targets), len(runs), len(peak_rows), out, time.time() - t0))
+          % (len(targets), len(runs), len(peak_rows), requested_out, time.time() - t0))
     return 0
+
+
+def main(argv=None) -> int:
+    """Run EIC extraction and discard an incomplete temporary stage on error."""
+    global _ACTIVE_STAGE
+    try:
+        return _main(argv)
+    except Exception:
+        if _ACTIVE_STAGE is not None:
+            discard_output(_ACTIVE_STAGE)
+        raise
+    finally:
+        _ACTIVE_STAGE = None
 
 
 if __name__ == "__main__":

@@ -26,15 +26,20 @@ INTEGRATION_COLUMNS = ['run_id', 'analyte_id', 'batch_id', 'role', 'channel_id',
                        'selection_status', 'candidates', 'peak_status', 'apex_rt_min',
                        'apex_intensity', 'height_above_baseline', 'area', 'area_unit',
                        'bounds_start_min', 'bounds_end_min', 'baseline', 'point_count',
-                       'expected_rt_min', 'rt_tolerance_min', 'response', 'response_mode']
+                       'expected_rt_min', 'rt_tolerance_min', 'response', 'response_mode',
+                       'internal_standard_id', 'internal_standard_area',
+                       'internal_standard_status']
 CALIBRATION_POINT_COLUMNS = ['batch_id', 'analyte_id', 'run_id', 'level_id', 'concentration',
                              'concentration_unit', 'concentration_source', 'response',
+                             'response_mode', 'internal_standard_id',
+                             'internal_standard_area',
                              'weight', 'back_calculated_concentration', 'bias_pct',
                              'residual', 'included', 'exclusion_reason']
 RESULT_COLUMNS = ['run_id', 'analyte_id', 'batch_id', 'role', 'status', 'validated',
                   'reported_concentration', 'vial_concentration', 'concentration_unit',
                   'dilution_factor', 'area', 'area_unit', 'apex_rt_min', 'response',
-                  'response_mode', 'calibration_equation', 'r2', 'r2_weighted',
+                  'response_mode', 'internal_standard_id', 'internal_standard_area',
+                  'internal_standard_status', 'calibration_equation', 'r2', 'r2_weighted',
                   'calibration_low', 'calibration_high', 'reasons']
 QC_COLUMNS = ['run_id', 'analyte_id', 'batch_id', 'role', 'status', 'validated',
               'qualifier_summary', 'blank_status', 'blank_area', 'blank_limit_area',
@@ -222,8 +227,53 @@ def _measure(row, analyte, measured):
         qualifiers.append(entry)
     return {'row': row, 'analyte': analyte, 'trace': trace, 'peaks': peaks,
             'selection': selection, 'peak': peak, 'response': response,
-            'response_mode': response_mode, 'qualifiers': qualifiers,
+            'response_mode': response_mode, 'response_error': None,
+            'internal_standard_id': None, 'internal_standard_area': None,
+            'internal_standard_status': 'not_used' if response_mode == 'external'
+            else 'not_evaluated', 'qualifiers': qualifiers,
             'window': window, 'meta': item['meta']}
+
+
+def _apply_internal_standard(measurement, analytes, measured):
+    """Measure and apply the configured same-injection internal standard."""
+    analyte = measurement['analyte']
+    standard_id = analyte['response'].get('internal_standard_id')
+    measurement['internal_standard_id'] = standard_id
+    try:
+        standard = analytes[standard_id]
+    except (KeyError, TypeError):
+        measurement['internal_standard_status'] = 'failed'
+        measurement['response_error'] = 'unknown_internal_standard: %r' % standard_id
+        return
+    try:
+        standard_measurement = _measure(measurement['row'], standard, measured)
+    except ValueError as error:
+        measurement['internal_standard_status'] = 'failed'
+        measurement['response_error'] = 'internal_standard_failed: %s' % error
+        return
+    standard_peak = standard_measurement['peak']
+    if standard_peak is None or standard_peak.get('status') != 'ok':
+        status = standard_measurement['selection'].get('status')
+        if standard_peak is not None:
+            status = standard_peak.get('status')
+        measurement['internal_standard_status'] = 'failed'
+        measurement['response_error'] = 'internal_standard_failed: %s' % (status or 'no_peak')
+        return
+    measurement['internal_standard_area'] = standard_peak.get('area')
+    if measurement['peak'] is None or measurement['peak'].get('status') != 'ok':
+        # The IS was valid, but there is no target response to ratio against.
+        # Preserve the valid IS diagnostic and let target peak status decide.
+        measurement['internal_standard_status'] = 'ok'
+        return
+    try:
+        measurement['response'] = calibration.response_value(
+            measurement['peak']['area'],
+            mode='internal', is_area=measurement['internal_standard_area'])
+    except ValueError as error:
+        measurement['internal_standard_status'] = 'failed'
+        measurement['response_error'] = str(error)
+        return
+    measurement['internal_standard_status'] = 'ok'
 
 
 def _integration_row(measurement):
@@ -248,7 +298,10 @@ def _integration_row(measurement):
             'expected_rt_min': analyte['expected_rt_min'],
             'rt_tolerance_min': analyte['rt_tolerance_min'],
             'response': measurement['response'],
-            'response_mode': measurement['response_mode']}
+            'response_mode': measurement['response_mode'],
+            'internal_standard_id': measurement['internal_standard_id'],
+            'internal_standard_area': measurement['internal_standard_area'],
+            'internal_standard_status': measurement['internal_standard_status']}
 
 
 # -- extract ---------------------------------------------------------------
@@ -308,7 +361,10 @@ def run_extract(*, batch_path, analytes_path, out, data_root=None, ingest_dir=No
                     'write_tic': write_tic, 'checksums': checksums},
         extra={'note': ('MS1 frames are excluded from every transition trace; the '
                         'MRM sum is the sum of the acquired transitions of one '
-                        'acquisition group, not a full-scan total ion current.')}))
+                        'acquisition group, not a full-scan total ion current.'),
+               'internal_standard_note': ('Extract writes configured transitions only; '
+                                           'quantify applies any configured internal '
+                                           'standard in the same injection.')}))
     return {'out_dir': out_dir, 'traces': len(written), 'runs': len(measured)}
 
 
@@ -341,6 +397,10 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
     for row in configuration['batch']['rows']:
         analyte = configuration['analytes']['analytes'][row['analyte_id']]
         measurements.append(_measure(row, analyte, measured))
+    for measurement in measurements:
+        if measurement['response_mode'] == 'internal':
+            _apply_internal_standard(measurement, configuration['analytes']['analytes'],
+                                     measured)
 
     models, model_rows, results, qc_rows, failures = {}, [], [], [], []
     groups = {}
@@ -363,6 +423,10 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                              'concentration': row['concentration'],
                              'concentration_unit': row['concentration_unit'],
                              'response': measurement['response'],
+                             'response_error': measurement['response_error'],
+                             'response_mode': measurement['response_mode'],
+                             'internal_standard_id': measurement['internal_standard_id'],
+                             'internal_standard_area': measurement['internal_standard_area'],
                              'include': row['include'],
                              'exclusion_reason': row['exclusion_reason'],
                              'concentration_source': row.get('concentration_source')})
@@ -376,6 +440,8 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
             model = None
         models[key] = model
         if model is not None:
+            model['response_mode'] = analyte['response']['mode']
+            model['internal_standard_id'] = analyte['response'].get('internal_standard_id')
             by_run = {point['run_id']: point for point in model['points']}
             for fit_row in fit_rows:
                 point = by_run.get(fit_row['run_id'], {})
@@ -386,6 +452,9 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                     'concentration_unit': fit_row['concentration_unit'],
                     'concentration_source': fit_row['concentration_source'],
                     'response': fit_row['response'], 'weight': point.get('weight'),
+                    'response_mode': fit_row['response_mode'],
+                    'internal_standard_id': fit_row['internal_standard_id'],
+                    'internal_standard_area': fit_row['internal_standard_area'],
                     'back_calculated_concentration': point.get('back_calculated_concentration'),
                     'bias_pct': point.get('bias_pct'), 'residual': point.get('residual'),
                     'included': fit_row['include'],
@@ -408,9 +477,18 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                 except ValueError as error:
                     failures.append({'run_id': row['run_id'], 'analyte_id': analyte_id,
                                      'stage': 'quantify', 'error': str(error)})
+                    quantification = {'status': 'quantification_failed',
+                                      'original_concentration': None,
+                                      'vial_concentration': None, 'error': str(error)}
+            elif model is not None and measurement['response_error']:
+                quantification = {'status': 'internal_standard_failed',
+                                  'original_concentration': None,
+                                  'vial_concentration': None,
+                                  'error': measurement['response_error']}
             independent = None
             qc_bias = None
             if row['role'] == 'qc' and quantification is not None \
+                    and quantification.get('vial_concentration') is not None \
                     and row['concentration'] not in (None, 0):
                 qc_bias = (quantification['vial_concentration'] / row['concentration']
                            - 1.) * 100.
@@ -427,7 +505,13 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                 qualifiers=[item for item in measurement['qualifiers']
                             if item['status'] not in ('not_evaluated',)],
                 blank=blank_check, independent_qc=independent,
-                loq_concentration=analyte['qc']['loq_concentration'])
+                loq_concentration=analyte['qc']['loq_concentration'],
+                calibration_failure=None if model is not None else
+                next((failure['error'] for failure in failures
+                      if failure.get('batch_id') == batch_id
+                      and failure.get('analyte_id') == analyte_id
+                      and failure.get('stage') == 'calibration'),
+                     'model unavailable'))
             results.append({
                 'run_id': row['run_id'], 'analyte_id': analyte_id, 'batch_id': batch_id,
                 'role': row['role'], 'status': aggregate['status'],
@@ -442,6 +526,9 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                 'apex_rt_min': peak['apex_rt_min'] if peak else None,
                 'response': measurement['response'],
                 'response_mode': measurement['response_mode'],
+                'internal_standard_id': measurement['internal_standard_id'],
+                'internal_standard_area': measurement['internal_standard_area'],
+                'internal_standard_status': measurement['internal_standard_status'],
                 'calibration_equation': None if model is None else model['equation'],
                 'r2': None if model is None else model['r2'],
                 'r2_weighted': None if model is None else model['r2_weighted'],
@@ -472,10 +559,10 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
     report.write_csv(out_dir / 'qc.csv', qc_rows, QC_COLUMNS)
     report.write_json(out_dir / 'calibration_models.json', {
         'models': [{'batch_id': key[0], 'analyte_id': key[1],
-                    'model': None if model is None else
-                    {name: value for name, value in model.items() if name != 'points'},
-                    'points': None if model is None else model['points']}
-                   for key, model in sorted(models.items())],
+                    'model': {name: value for name, value in model.items()
+                              if name != 'points'},
+                    'points': model['points']}
+                   for key, model in sorted(models.items()) if model is not None],
         'failures': failures})
     if failures:
         report.write_json(out_dir / 'failures.json', {'failures': failures})
@@ -504,6 +591,16 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
         parameters={'started_utc': started, 'data_root': str(data_root or ''),
                     'plots': plots, 'checksums': checksums},
         extra={'figures': figures, 'failures': failures,
+               'internal_standard_note': ('Internal-standard response uses the '
+                                           'configured analyte transition in the same '
+                                           'injection. External-standard analytes use '
+                                           'no internal standard.'),
+               'internal_standard_configuration': {
+                   analyte_id: {'mode': analyte['response']['mode'],
+                                'internal_standard_id': analyte['response'].get(
+                                    'internal_standard_id')}
+                   for analyte_id, analyte in
+                   configuration['analytes']['analytes'].items()},
                'analyte_settings': {analyte_id: {
                    'expected_rt_min': analyte['expected_rt_min'],
                    'rt_tolerance_min': analyte['rt_tolerance_min'],
@@ -517,5 +614,6 @@ def run_quantify(*, batch_path, analytes_path, out, data_root=None, ingest_dir=N
                    'identity_note': analyte['identity_note']}
                    for analyte_id, analyte
                    in configuration['analytes']['analytes'].items()}}))
-    return {'out_dir': out_dir, 'results': len(results), 'models': len(models),
+    return {'out_dir': out_dir, 'results': len(results),
+            'models': sum(model is not None for model in models.values()),
             'failures': failures}

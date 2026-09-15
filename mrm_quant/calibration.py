@@ -70,6 +70,9 @@ def _fit_points(rows, weighting):
             raise ValueError('negative_concentration: run %r concentration is %r'
                              % (row.get('run_id'), concentration))
         if response is None:
+            response_error = row.get('response_error')
+            if response_error:
+                raise ValueError(str(response_error))
             raise ValueError('missing_response: run %r has no response'
                              % row.get('run_id'))
         if not _finite(response):
@@ -177,7 +180,7 @@ def fit_calibration(rows, *, weighting, intercept):
 
 
 def response_value(area, *, mode, is_area=None):
-    """Quantification response: the area itself, or the ratio to a fixed internal standard."""
+    """Quantification response: area itself or target area over IS area."""
     if mode not in RESPONSE_MODES:
         raise ValueError('invalid_response_mode: %r is not one of %s'
                          % (mode, ', '.join(RESPONSE_MODES)))

@@ -31,6 +31,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+try:
+    from output import begin_output, commit_output, discard_output
+except ImportError:
+    from ingest.output import begin_output, commit_output, discard_output
+
 WORKSPACE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_IN = os.path.join(WORKSPACE, "ingested")
 
@@ -334,47 +339,54 @@ def main(argv=None) -> int:
         print("no matching runs", file=sys.stderr)
         return 1
 
-    out = args.out or os.path.join(args.ingested, "plots")
-    for sub in ("tic", "avg_spectrum", "avg_spectrum_unit"):
-        os.makedirs(os.path.join(out, sub), exist_ok=True)
+    requested_out = args.out or os.path.join(args.ingested, "plots")
+    out = begin_output(requested_out)
+    try:
+        for sub in ("tic", "avg_spectrum", "avg_spectrum_unit"):
+            os.makedirs(os.path.join(out, sub), exist_ok=True)
 
-    tics, unit_specs = {}, {}
-    written = 0
-    for run in runs:
-        rd = os.path.join(data_dir, run)
+        tics, unit_specs = {}, {}
+        written = 0
+        for run in runs:
+            rd = os.path.join(data_dir, run)
 
-        tic = read_columns(os.path.join(rd, "tic.csv"), ["rt_min", "tic"])
-        tics[run] = tic
-        plot_tic(run, tic, os.path.join(out, "tic", run + ".png"), args.dpi)
+            tic = read_columns(os.path.join(rd, "tic.csv"), ["rt_min", "tic"])
+            tics[run] = tic
+            plot_tic(run, tic, os.path.join(out, "tic", run + ".png"), args.dpi)
 
-        fine = read_columns(os.path.join(rd, "avg_spectrum.csv"),
-                            ["mz", "relative_pct"])
-        plot_spectrum(run, fine,
-                      os.path.join(out, "avg_spectrum", run + ".png"),
-                      args.dpi, kind="fine", logy=args.logy)
+            fine = read_columns(os.path.join(rd, "avg_spectrum.csv"),
+                                ["mz", "relative_pct"])
+            plot_spectrum(run, fine,
+                          os.path.join(out, "avg_spectrum", run + ".png"),
+                          args.dpi, kind="fine", logy=args.logy)
 
-        unit = read_columns(os.path.join(rd, "avg_spectrum_unit.csv"),
-                            ["mz", "relative_pct"])
-        unit_specs[run] = unit
-        plot_spectrum(run, unit,
-                      os.path.join(out, "avg_spectrum_unit", run + ".png"),
-                      args.dpi, kind="unit", logy=args.logy)
+            unit = read_columns(os.path.join(rd, "avg_spectrum_unit.csv"),
+                                ["mz", "relative_pct"])
+            unit_specs[run] = unit
+            plot_spectrum(run, unit,
+                          os.path.join(out, "avg_spectrum_unit", run + ".png"),
+                          args.dpi, kind="unit", logy=args.logy)
 
+            written += 3
+            top = np.argsort(unit["relative_pct"])[::-1][:5]
+            print("  %-5s TIC max %.3g @ %.2f min | top m/z %s"
+                  % (run, tic["tic"].max(),
+                     tic["rt_min"][int(np.argmax(tic["tic"]))],
+                     ", ".join("%d" % round(unit["mz"][i]) for i in top)))
+
+        plot_tic_grid(runs, tics, os.path.join(out, "tic_grid.png"), args.dpi)
+        plot_tic_overlay(runs, tics, os.path.join(out, "tic_overlay.png"), args.dpi)
+        plot_spectrum_grid(runs, unit_specs,
+                           os.path.join(out, "avg_spectrum_unit_grid.png"),
+                           args.dpi, logy=args.logy)
         written += 3
-        top = np.argsort(unit["relative_pct"])[::-1][:5]
-        print("  %-5s TIC max %.3g @ %.2f min | top m/z %s"
-              % (run, tic["tic"].max(),
-                 tic["rt_min"][int(np.argmax(tic["tic"]))],
-                 ", ".join("%d" % round(unit["mz"][i]) for i in top)))
 
-    plot_tic_grid(runs, tics, os.path.join(out, "tic_grid.png"), args.dpi)
-    plot_tic_overlay(runs, tics, os.path.join(out, "tic_overlay.png"), args.dpi)
-    plot_spectrum_grid(runs, unit_specs,
-                       os.path.join(out, "avg_spectrum_unit_grid.png"),
-                       args.dpi, logy=args.logy)
-    written += 3
+        commit_output(out, requested_out, group='plot')
+    except Exception:
+        discard_output(out)
+        raise
 
-    print("\n%d PNG files written to %s" % (written, out))
+    print("\n%d PNG files written to %s" % (written, requested_out))
     return 0
 
 

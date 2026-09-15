@@ -26,7 +26,7 @@ python3 -m mrm_quant quantify  --batch quant_config/september-lq.batch.csv \
 
 `batch.csv` 每行一次进样与一个目标物：`run_id,dataset_path,batch_id,analyte_id,role,level_id,concentration,concentration_unit,concentration_basis,dilution_factor,internal_standard_id,internal_standard_concentration,include,exclusion_reason`。`role` 必须显式写成 calibration / blank / qc / unknown，不从文件名推断；`include=false` 必须给理由；`(run_id,analyte_id)` 不可重复；同一 `run_id` 不能指向两个目录。字段内不要出现逗号，除非按 CSV 规则加引号。
 
-`analytes.json` 每个目标物给出 `expected_rt_min`、`rt_tolerance_min`、`search_margin_min`、一条 `quantifier` 离子对、可选 `qualifiers`、`integration`（`baseline` 取 `none` 或 `linear_endpoints`，以及 `min_relative_height`、`min_separation_min`、`boundary_fraction`、`max_gap_min`、`min_points`）、`calibration`（`weighting` 取 `none`/`1/x`/`1/x2`，`intercept` 取 `free`/`zero`，`concentration_unit`，以及浓度系列 `series`）、`response`（`external` 或固定内标 `internal`）和 `qc`（`blank_run_id`、`blank_limit_area`、`loq_concentration`、`qualifier_relative_tolerance`、`qualifier_rt_tolerance_min`、`qc_relative_tolerance`）。
+`analytes.json` 每个目标物给出 `expected_rt_min`、`rt_tolerance_min`、`search_margin_min`、一条 `quantifier` 离子对、可选 `qualifiers`、`integration`（`baseline` 取 `none` 或 `linear_endpoints`，以及 `min_relative_height`、`min_separation_min`、`boundary_fraction`、`max_gap_min`、`min_points`）、`calibration`（`weighting` 取 `none`/`1/x`/`1/x2`，`intercept` 取 `free`/`zero`，`concentration_unit`，以及浓度系列 `series`）、`response` 和 `qc`（`blank_run_id`、`blank_limit_area`、`loq_concentration`、`qualifier_relative_tolerance`、`qualifier_rt_tolerance_min`、`qc_relative_tolerance`）。`response.mode=external` 直接使用目标峰面积并记录未使用内标；`response.mode=internal` 必须给出另一个目标物的 `internal_standard_id`，在同一进样中按其配置的离子对和保留时间积分，使用 `目标面积/内标面积` 作为响应。内标缺失、峰不可用或配置不一致会明确失败，不会静默回退为外标。
 
 浓度可以写在 `batch.csv` 的 `concentration` 列，也可以由 `series` 生成（`top_concentration`、`dilution_step`、`levels`、`level_id_format`）。两者都给时必须一致，不一致报 `concentration_conflict`；只有 `level_id` 而系列里没有该级别报 `unknown_level`。九月批次用 `top_concentration=1.0`、`dilution_step=2.0`、`levels=10`，即 S1=1 mg/mL 到 S10=1/512 mg/mL。
 
@@ -38,7 +38,7 @@ python3 -m mrm_quant quantify  --batch quant_config/september-lq.batch.csv \
 
 ## 状态
 
-`results.csv` 的 `status` 区分：`ok`、`no_peak`、`ambiguous_peak`（窗口内多个候选，需人工复核）、`insufficient_points`、`non_positive_area`、`negative_backcalc`、`below_calibration_range`、`above_calibration_range`、`below_validated_loq`、`ion_ratio_fail`、`rt_mismatch`、`blank_contamination`、`qc_fail`。只有 `ok` 才给出 `reported_concentration`，其余保留 `vial_concentration` 等诊断值而不发布浓度，不外推、不截零、不输出 ND。`validated` 只有在空白限值与独立 QC 都配置并通过时才为真；未配置即为未验证，不声称通过。校准范围下限不等于已验证 LOQ，后者要单独配 `loq_concentration`。
+`results.csv` 的 `status` 区分：`ok`、`calibration_failed`、`quantification_failed`、`internal_standard_failed`、`no_peak`、`ambiguous_peak`（窗口内多个候选，需人工复核）、`insufficient_points`、`non_positive_area`、`negative_backcalc`、`below_calibration_range`、`above_calibration_range`、`below_validated_loq`、`ion_ratio_fail`、`rt_mismatch`、`blank_contamination`、`qc_fail`。只有 `ok` 才给出 `reported_concentration`，其余保留诊断值而不发布浓度，不外推、不截零、不输出 ND。曲线拟合失败时所有受影响结果都为 `calibration_failed`，并在 `reasons` 保留原始错误；模型汇总和 CLI 只计成功模型。`validated` 只有在空白限值与独立 QC 都配置并通过时才为真；未配置即为未验证，不声称通过。校准范围下限不等于已验证 LOQ，后者要单独配 `loq_concentration`。
 
 离子比定义为 `A_qualifier/A_quantifier`，容差为 `abs(r/r_ref-1)`；参考比值必须来自合格标准。三个 Ses 通道是否属于同一物质尚未确认，所以九月与八月配置都提取定性通道但不做离子比判定（`reference_ratio` 为空即 `not_evaluated`）。
 

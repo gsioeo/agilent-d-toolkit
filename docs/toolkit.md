@@ -165,6 +165,9 @@ comparing across sessions.
 was losing precision (20 microseconds on scan start time); values are written
 with `repr()`.
 
-**`ingested/` is regenerated, not merged.** Re-running a stage overwrites its
-outputs. `manifest.json` only lists an `mzml` output if that run was ingested
-with `--mzml` in the same invocation.
+**`ingested/` is regenerated through a temporary stage.** A completed stage
+replaces only artifacts it generated, preserving unexpected user files in the
+output directory; an interrupted stage leaves the prior output intact.
+Duplicate `.d` basenames are rejected before any processing. `manifest.json`
+only lists an `mzml` output if that run was ingested with `--mzml` in the same
+invocation.

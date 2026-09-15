@@ -17,7 +17,9 @@ BLOCKING_STATUSES = ('no_peak', 'ambiguous_peak', 'insufficient_points',
                      'non_positive_area', 'negative_backcalc',
                      'below_calibration_range', 'above_calibration_range',
                      'ion_ratio_fail', 'rt_mismatch', 'invalid_quantifier',
-                     'blank_contamination', 'below_validated_loq')
+                     'blank_contamination', 'below_validated_loq',
+                     'calibration_failed', 'quantification_failed',
+                     'internal_standard_failed')
 
 
 def _finite(value):
@@ -74,7 +76,7 @@ def check_blank(blank_area, *, limit_area=None, blank_run_id=None):
 
 def aggregate_status(*, peak_selection=None, integration=None, quantification=None,
                      qualifiers=(), blank=None, independent_qc=None,
-                     loq_concentration=None):
+                     loq_concentration=None, calibration_failure=None):
     """Final status and reportable concentration for one run and analyte.
 
     Returns ``status``, ``reported_concentration``, ``validated`` and the reasons
@@ -91,12 +93,15 @@ def aggregate_status(*, peak_selection=None, integration=None, quantification=No
             status = code
         reasons.append(detail)
 
+    if calibration_failure is not None:
+        block('calibration_failed', 'calibration failed: %s' % calibration_failure)
     if peak_selection is not None and peak_selection.get('status') != 'ok':
         block(peak_selection['status'], 'peak selection: %s' % peak_selection['status'])
     if integration is not None and integration.get('status') not in (None, 'ok'):
         block(integration['status'], 'integration: %s' % integration['status'])
     if quantification is not None and quantification.get('status') != 'ok':
-        block(quantification['status'], 'quantification: %s' % quantification['status'])
+        detail = quantification.get('error') or quantification['status']
+        block(quantification['status'], 'quantification: %s' % detail)
     for qualifier in qualifiers or ():
         if qualifier.get('status') != 'ok':
             block(qualifier['status'], 'qualifier %s: %s'

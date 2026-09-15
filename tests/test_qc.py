@@ -85,6 +85,14 @@ class AggregationTests(unittest.TestCase):
         self.assertIsNone(result['reported_concentration'])
         self.assertAlmostEqual(result['vial_concentration'], 0.05)
 
+    def test_calibration_failure_blocks_result_and_preserves_error(self):
+        result = qc.aggregate_status(
+            peak_selection={'status': 'ok'}, integration={'status': 'ok'},
+            quantification=None, calibration_failure='insufficient_points: 0 usable')
+        self.assertEqual(result['status'], 'calibration_failed')
+        self.assertIsNone(result['reported_concentration'])
+        self.assertIn('insufficient_points: 0 usable', '; '.join(result['reasons']))
+
 
 class OutputPathTests(unittest.TestCase):
     def test_symlink_into_a_raw_dataset_is_refused(self):

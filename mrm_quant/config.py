@@ -176,6 +176,30 @@ def load_analytes(path):
             'qc': _merge(DEFAULT_QC, entry.get('qc'), '%s.qc' % analyte_id)}
     if not analytes:
         raise ValueError('invalid_analytes: no analyte is defined')
+    for analyte_id, analyte in analytes.items():
+        response = analyte['response']
+        mode = response.get('mode')
+        if mode not in ('external', 'internal'):
+            raise ValueError('invalid_response_mode: %r is not external or internal'
+                             % mode)
+        standard_id = response.get('internal_standard_id')
+        if mode == 'external':
+            if standard_id is not None:
+                raise ValueError('internal_standard_unexpected: %r uses external '
+                                 'response but declares %r' % (analyte_id, standard_id))
+            continue
+        if not standard_id:
+            raise ValueError('missing_internal_standard: %r uses internal response '
+                             'without internal_standard_id' % analyte_id)
+        if standard_id == analyte_id:
+            raise ValueError('invalid_internal_standard: %r cannot reference itself'
+                             % analyte_id)
+        if standard_id not in analytes:
+            raise ValueError('unknown_internal_standard: %r refers to %r'
+                             % (analyte_id, standard_id))
+        if analytes[standard_id]['response'].get('mode') != 'external':
+            raise ValueError('invalid_internal_standard: %r must use external '
+                             'response' % standard_id)
     return {'analytes': analytes, 'path': str(path), 'sha256': sha256_file(path),
             'version': document.get('version', 'v1'),
             'note': document.get('note')}
@@ -307,6 +331,14 @@ def load_configuration(batch_path, analytes_path, *, data_root=None,
             if row['analyte_id'] not in analytes['analytes']:
                 raise ValueError('unknown_analyte: run %r refers to %r'
                                  % (row['run_id'], row['analyte_id']))
+    for row in batch['rows']:
+        response = analytes['analytes'][row['analyte_id']]['response']
+        declared = row.get('internal_standard_id')
+        configured = response.get('internal_standard_id')
+        if declared is not None and declared != configured:
+            raise ValueError('internal_standard_mismatch: run %r declares %r but '
+                             'the analyte config declares %r'
+                             % (row['run_id'], declared, configured))
     batches = sorted({row['batch_id'] for row in batch['rows']})
     return {'batch': batch, 'analytes': analytes, 'batch_ids': batches,
             'config_hash': hashlib.sha256(
