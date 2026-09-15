@@ -63,7 +63,7 @@ figures without re-reading the raw Agilent binaries:
 
 ```bash
 Rscript ingest/plot_r.R
-Rscript ingest/plot_r.R --only STD s22 --dpi 300
+Rscript ingest/plot_r.R --only run1 run2 --dpi 300
 ```
 
 The R script reads the same `ingested/data/<run>/` and optional
@@ -84,6 +84,23 @@ python3 -m mrm_quant inspect  --source ../batch-folder --out quant_results/inspe
 python3 -m mrm_quant extract   --batch batch.csv --analytes analytes.json --out quant_results/traces_001
 python3 -m mrm_quant quantify  --batch batch.csv --analytes analytes.json --out quant_results/quant_001
 ```
+
+Version v2 also provides a configuration-free MRM channel search, an optional
+MassQL bridge and an independent reader comparison:
+
+```bash
+python3 -m mrm_quant search-mrm --source ../batch-folder --out quant_results/search_001 \
+  --q1 204 --q3 93 --ce 30 --rt-range "14.2 14.7"
+python3 -m mrm_quant search-massql --source ../run.d --out quant_results/massql_001 \
+  --query 'QUERY scaninfo(MS2DATA) WHERE MS2PREC=204:TOLERANCEMZ=0.01'
+python3 -m mrm_quant validate-reader --source ../batch-folder \
+  --out quant_results/reader_validation_001
+```
+
+The last two commands use optional packages installed with
+`python3 -m pip install -r requirements-optional.txt`. See
+[docs/mrm-search.md](docs/mrm-search.md) for their outputs and validation
+semantics.
 
 `inspect` needs no concentrations: it lists every acquired channel with its
 Q1/Q3, collision energy, dwell and frame count, and ranks the channels by
@@ -202,16 +219,14 @@ promotion silently narrowing a window, and the mzML id constraints.
 [docs/agilent-d-format.md](docs/agilent-d-format.md) documents the byte layout
 field by field.
 
-`mrm_quant/` is specified by 28 executable contracts written before the code and
-run against the real data: the September batch's `204 -> 93` channel must return
-its 2454 native MRM points with the stored first-frame intensity, MS1 frames may
-not leak into a transition, a declared product missing from a frame is `None`
-rather than zero, a measured zero stays zero, and a mass tolerance wide enough to
-cover two acquired channels is rejected instead of merged. The integrator is
-checked against hand-computed areas on unevenly spaced points, and the three
-weighting options against hand-computed slopes and intercepts; the reported `r2`
-was compared with `numpy.polyfit` plus Pearson r² on the real curve and agrees to
-the last digit. The whole suite is 115 tests:
+`mrm_quant/` is specified by executable contracts and synthetic fixtures. They
+verify that MS1 frames cannot leak into an MRM transition, a declared but
+missing product is `None` rather than zero, a measured zero stays zero, and a
+mass tolerance covering two acquired channels is rejected instead of merged.
+The integrator is checked against hand-computed areas on unevenly spaced points,
+and the three weighting options against hand-computed slopes and intercepts.
+Optional real-data structural checks are enabled through an ignored local
+manifest and do not embed paths, identities or observed values in the tests.
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
@@ -222,8 +237,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
 The reader and the `ingest/` pipeline were developed and validated against
 **MS1 full-scan EI data, centroid (`PeakDetected`) storage, one time segment**,
 written by MassHunter Acquisition 13.x from a triple-quadrupole GC/MS.
-`mrm_quant/` adds **MRM (`ScanType` 256, MS level 2)** on two batches from the
-same instrument, where MRM and MS1 frames alternate within one cycle.
+`mrm_quant/` adds **MRM (`ScanType` 256, MS level 2)**, including acquisitions
+where MRM and MS1 frames alternate within one cycle.
 
 Not exercised, and likely to need work:
 
@@ -273,7 +288,7 @@ ingest/plot_r.R       optional R/ggplot2 plotting from ingested CSVs
 ingest/eic.py         stage 3: extracted ion chromatograms, peak table
 ingest/run_all.py     all three stages under one set of options
 ingest/make_patch.py  regenerates gcms-agilent-toolkit.patch
-mrm_quant/            MRM extraction and same-batch quantification (v1)
+mrm_quant/            MRM extraction and same-batch quantification (v2)
   reader_adapter.py   read-only adapter over ingest/agilent_d.py, layout checks
   transitions.py      transition selection, MS1 TIC and MRM sum kept apart
   integration.py      windowed integration and retention-time peak selection
@@ -283,7 +298,7 @@ mrm_quant/            MRM extraction and same-batch quantification (v1)
   pipeline.py         inspect, extract, quantify
   report.py           tables, provenance, figures
   templates/          example configuration, no sample identities
-tests/                115 tests: legacy regression, 28 contracts, real batches
+tests/                synthetic contracts plus optional local real-data checks
 docs/                 format reference, tool reference, mrm-quant reference
 ```
 
@@ -295,14 +310,16 @@ repository and is not part of that patch.
 
 ## Data policy
 
-This repository contains **no instrument data**. `.gitignore` excludes `.d`
+No raw instrument files are tracked. Tests and public documentation use
+synthetic values and generic examples; optional real-data checks are driven by
+`tests/data-paths.local.json`, which is ignored. `.gitignore` excludes `.d`
 directories, raw instrument files, tune and method reports, generated output,
-figures, CSV and mzML, plus the quantification inputs and outputs
+figures, CSV and mzML, plus quantification inputs and outputs
 (`quant_config/`, `batch*.csv`, `analytes*.json`, `quant_results/`) because a
 batch table names samples and concentrations. Instrument serial numbers,
-operator names, sample identities and acquisition paths exist only in the raw
-files, in `ingested/` and in those local configurations, none of which is
-tracked. Before publishing, check `git status --ignored`.
+operator names, sample identities, acquisition paths and dataset-specific
+numeric observations remain in raw files, local outputs and ignored
+configurations. Before publishing, check `git status --ignored`.
 
 > **Careful:** if the repository lives in the same folder as your data, that
 > data is *ignored*, not *tracked* — `git clean -fdx` would delete it. Use

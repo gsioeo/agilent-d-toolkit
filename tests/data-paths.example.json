@@ -1,0 +1,13 @@
+{
+  "datasets": {
+    "ms1_reference": {
+      "path": "/absolute/path/to/full-scan-run.d"
+    },
+    "mrm_primary": {
+      "path": "/absolute/path/to/interleaved-mrm-run.d"
+    },
+    "mrm_secondary": {
+      "path": "/absolute/path/to/a-run-with-a-different-method.d"
+    }
+  }
+}

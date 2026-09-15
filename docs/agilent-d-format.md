@@ -135,8 +135,8 @@ with AgilentDotD("data/run1.d") as ds:
 
 ## Validation
 
-Every check below was run over all 6268-6269 scans of all nine runs, not on a
-sample:
+Every check below was run over every scan in the private validation datasets,
+not on a sample:
 
 | check | result |
 |-------|--------|
@@ -145,12 +145,12 @@ sample:
 | m/z array strictly ascending | holds, every scan |
 | `mz[0] == MinX`, `mz[-1] == MaxX` | exact, every scan |
 | `ByteCount == PointCount * 8` | holds, every scan |
-| last peak block ends at MSPeak.bin EOF | exact, all nine files |
-| record count vs `NumOfScans` in MSTS.xml | matches, all nine files |
+| last peak block ends at MSPeak.bin EOF | exact, every file |
+| record count vs `NumOfScans` in MSTS.xml | matches, every file |
 | first/last `ScanTime` vs MSTS.xml `StartTime`/`EndTime` | matches |
 
 The TIC identity is the strong one: it is an independent quantity stored in a
-different file from the peak lists, so reproducing it exactly for ~56,000 scans
+different file from the peak lists, so reproducing it across the full validation set
 confirms the record stride, the peak-block offsets, the float32 interpretation
 and the m/z-then-abundance ordering all at once.
 

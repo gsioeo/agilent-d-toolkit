@@ -1,19 +1,14 @@
-"""Path resolution for the repository test suite.
-
-The package under test lives in this repository; the raw ``.d`` datasets live
-outside it, under a data root that is configurable through ``GCMS_DATA_ROOT``
-and defaults to the repository's parent directory. Nothing here asserts
-anything: it only resolves paths and loads the existing reader by explicit
-file path, so the tests stay independent of the working directory.
-"""
+"""Shared paths and optional, local-only real-data fixtures for tests."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
 
 REPO = Path(__file__).resolve().parents[1]
-DATA_ROOT = Path(os.environ.get('GCMS_DATA_ROOT') or REPO.parent).resolve()
 LEGACY_DIR = REPO / 'ingest'
+FIXTURE_MANIFEST = Path(os.environ.get(
+    'GCMS_TEST_MANIFEST', REPO / 'tests' / 'data-paths.local.json')).resolve()
 
 sys.dont_write_bytecode = True
 if str(REPO) not in sys.path:
@@ -29,10 +24,22 @@ def load_legacy(module_name='agilent_d'):
     return module
 
 
-def dataset_path(relative):
-    """Resolve a dataset path against the data root, then the repository."""
-    for base in (DATA_ROOT, REPO):
-        candidate = base / relative
-        if candidate.exists():
-            return candidate
-    return DATA_ROOT / relative
+def fixture_manifest():
+    """Load private fixture paths without embedding them in tracked tests."""
+    if not FIXTURE_MANIFEST.is_file():
+        return {}
+    with open(FIXTURE_MANIFEST, encoding='utf-8') as handle:
+        document = json.load(handle)
+    return document.get('datasets', {})
+
+
+def dataset_path(key):
+    """Return a named private dataset, or a non-existent path when absent."""
+    entry = fixture_manifest().get(key, {})
+    value = entry.get('path') if isinstance(entry, dict) else entry
+    return Path(value).expanduser().resolve() if value else REPO / '.missing-fixture' / key
+
+
+def fixture_value(key, name, default=None):
+    entry = fixture_manifest().get(key, {})
+    return entry.get(name, default) if isinstance(entry, dict) else default

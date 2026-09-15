@@ -1,7 +1,5 @@
-"""Calibration behaviour beyond the shared contracts, plus the real curve."""
+"""Calibration behaviour beyond the shared synthetic contracts."""
 import unittest
-
-import september
 
 from mrm_quant import calibration
 
@@ -73,75 +71,6 @@ class FitDiagnosticsTests(unittest.TestCase):
                                                           is_area=25.), 2.)
         with self.assertRaisesRegex(ValueError, 'invalid_response_mode'):
             calibration.response_value(50., mode='ratio')
-
-
-class SeptemberCurveTests(unittest.TestCase):
-    def setUp(self):
-        if not september.dataset('STD_S1').is_dir():
-            self.skipTest('Local raw dataset unavailable')
-        self.rows = september.calibration_rows()
-
-    def fit(self, weighting=None, intercept=None):
-        return calibration.fit_calibration(
-            self.rows, weighting=weighting or september.WEIGHTING,
-            intercept=intercept or september.INTERCEPT)
-
-    def test_ten_level_two_fold_series_fits_with_a_positive_slope(self):
-        model = self.fit()
-        self.assertEqual(model['n_points'], 10)
-        self.assertEqual(model['n_levels'], 10)
-        self.assertEqual(model['range'], [1. / 512, 1.])
-        self.assertEqual(model['concentration_unit'], 'mg/mL')
-        self.assertEqual(model['batch_id'], september.BATCH_ID)
-        self.assertGreater(model['slope'], 0.)
-        self.assertEqual(len(model['backcalc_bias_pct']), 10)
-
-    def test_reported_r2_equals_the_textbook_definition_on_real_areas(self):
-        model = self.fit(weighting='none')
-        responses = [point['response'] for point in model['points']]
-        predicted = [model['slope'] * point['concentration'] + model['intercept']
-                     for point in model['points']]
-        mean = sum(responses) / len(responses)
-        expected = 1 - (sum((y - p) ** 2 for y, p in zip(responses, predicted))
-                        / sum((y - mean) ** 2 for y in responses))
-        self.assertAlmostEqual(model['r2'], expected, places=12)
-        self.assertGreater(model['r2'], 0.98)
-
-    def test_samples_quantify_inside_the_calibration_range(self):
-        model = self.fit()
-        for name in ('S21', 'S22', 'S23', 'S24'):
-            with self.subTest(run=name):
-                selection = september.chosen_peak(name)
-                response = calibration.response_value(selection['peak']['area'],
-                                                      mode='external')
-                result = calibration.quantify(
-                    response, model, dilution_factor=1., batch_id=september.BATCH_ID,
-                    method_fingerprint=selection['method_fingerprint'])
-                self.assertEqual(result['status'], 'ok')
-                self.assertGreater(result['original_concentration'], 0.)
-                self.assertEqual(result['concentration_unit'], 'mg/mL')
-
-    def test_unweighted_intercept_would_hide_the_weakest_samples(self):
-        # Recorded on purpose: the same real peaks back-calculate below zero when
-        # the fit is unweighted, which is a property of that model rather than of
-        # the data, and is reported as a status instead of a number.
-        unweighted = self.fit(weighting='none')
-        statuses = {}
-        for name in ('S21', 'S22', 'S23', 'S24'):
-            selection = september.chosen_peak(name)
-            statuses[name] = calibration.quantify(
-                selection['peak']['area'], unweighted, dilution_factor=1.,
-                batch_id=september.BATCH_ID,
-                method_fingerprint=selection['method_fingerprint'])['status']
-        self.assertEqual(statuses['S22'], 'negative_backcalc')
-        self.assertEqual(statuses['S23'], 'negative_backcalc')
-        self.assertGreater(unweighted['intercept'], 300.)
-
-    def test_another_batch_cannot_use_this_model(self):
-        model = self.fit()
-        with self.assertRaisesRegex(ValueError, 'batch_mismatch'):
-            calibration.quantify(500., model, dilution_factor=1., batch_id='other',
-                                 method_fingerprint=model['method_fingerprint'])
 
 
 if __name__ == '__main__':

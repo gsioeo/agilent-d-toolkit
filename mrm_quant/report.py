@@ -7,6 +7,7 @@ tables are still complete.
 import csv
 import datetime
 import hashlib
+import importlib.metadata
 import json
 import platform
 import sys
@@ -66,13 +67,13 @@ def dataset_checksums(dataset_path, *, files=CHECKSUM_FILES):
 
 def dependency_versions():
     versions = {'python': sys.version.split()[0], 'platform': platform.platform()}
-    for name in ('numpy', 'matplotlib'):
+    for name, distribution in (('numpy', 'numpy'), ('matplotlib', 'matplotlib'),
+                               ('pandas', 'pandas'), ('massql', 'massql'),
+                               ('rainbow', 'rainbow-api')):
         try:
-            module = __import__(name)
-        except ImportError:
+            versions[name] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
             versions[name] = None
-        else:
-            versions[name] = getattr(module, '__version__', 'unknown')
     return versions
 
 

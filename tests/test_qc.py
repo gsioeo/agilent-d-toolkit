@@ -118,7 +118,7 @@ class OutputPathTests(unittest.TestCase):
             self.assertEqual(qc.validate_output_path(target), target.resolve())
 
     def test_repository_datasets_cannot_be_used_as_output(self):
-        dataset = context.dataset_path('TSJ-0907/LQ/STD_S1.d')
+        dataset = context.dataset_path('mrm_primary')
         if not dataset.is_dir():
             self.skipTest('Local raw dataset unavailable')
         with self.assertRaisesRegex(ValueError, 'unsafe_output'):

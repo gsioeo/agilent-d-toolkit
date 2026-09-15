@@ -7,9 +7,13 @@ from .calibration import fit_calibration, quantify, response_value
 from .integration import find_peaks, integrate_peak, select_peak
 from .qc import aggregate_status, check_blank, check_qualifier, validate_output_path
 from .transitions import extract_run, extract_transition, separate_tic
+from .search import channel_matches, search_channels
+from .massql_adapter import records_to_dataframes, scan_context
+from .reader_validation import compare_records
 
 __all__ = ['extract_transition', 'extract_run', 'separate_tic',
            'integrate_peak', 'find_peaks', 'select_peak',
            'fit_calibration', 'response_value', 'quantify',
            'check_qualifier', 'check_blank', 'aggregate_status',
-           'validate_output_path']
+           'validate_output_path', 'channel_matches', 'search_channels',
+           'records_to_dataframes', 'scan_context', 'compare_records']

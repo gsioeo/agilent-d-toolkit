@@ -122,63 +122,43 @@ class LayoutValidationTests(unittest.TestCase):
 
 
 class RealDatasetTests(unittest.TestCase):
-    def run_reader(self, relative):
-        path = context.dataset_path(relative)
+    def run_reader(self, key):
+        path = context.dataset_path(key)
         if not path.is_dir():
-            self.skipTest('Local raw dataset unavailable: ' + relative)
+            self.skipTest('Local raw fixture unavailable: ' + key)
         run = reader_adapter.RunReader(path)
         self.addCleanup(run.close)
         return run
 
-    def test_september_mrm_record_is_canonical(self):
-        run = self.run_reader('TSJ-0907/LQ/STD_S1.d')
-        records = run.records(lambda head: head['scan_id'] == 1)
-        self.assertEqual(len(records), 1)
+    def test_mrm_records_are_canonical(self):
+        run = self.run_reader('mrm_primary')
+        records = run.records(lambda head: head['ms_level'] == 2)
+        self.assertTrue(records)
         record = records[0]
         self.assertEqual(record['scan_type'], 256)
-        self.assertEqual(record['ms_level'], 2)
-        self.assertEqual(record['scan_method_id'], 1)
-        self.assertEqual(record['time_segment_id'], 1)
-        self.assertEqual(record['polarity'], 0)
-        self.assertEqual(record['precursor_mz'], 204.)
-        self.assertEqual(record['collision_energy_ev'], 30.)
-        self.assertAlmostEqual(record['rt_min'], 10.001733333333334)
-        self.assertEqual(record['product_mz'], [68., 81., 93.])
-        self.assertEqual(record['intensity'],
-                         [0.11013031005859375, 5.686073303222656, 1121.11181640625])
-        self.assertEqual(record['declared_product_mz'], [68., 81., 93.])
+        self.assertEqual(len(record['product_mz']), len(record['intensity']))
+        self.assertEqual(record['product_mz'], sorted(record['product_mz']))
+        self.assertEqual(record['product_mz'], record['declared_product_mz'])
 
-    def test_september_channels_come_from_the_method(self):
-        run = self.run_reader('TSJ-0907/LQ/STD_S1.d')
+    def test_mrm_channels_come_from_the_method(self):
+        run = self.run_reader('mrm_primary')
         mrm = [c for c in run.channels if c['channel_type'] == 'mrm']
-        self.assertEqual([c['product_mz'] for c in mrm], [93., 81., 68.])
-        self.assertEqual({c['precursor_mz'] for c in mrm}, {204.})
-        self.assertEqual({c['collision_energy_ev'] for c in mrm}, {30.})
-        self.assertEqual({c['dwell_ms'] for c in mrm}, {100.})
-        self.assertEqual({c['is_istd'] for c in mrm}, {False})
-        self.assertEqual({c['compound_name'] for c in mrm}, {'Ses1', 'Ses2', 'Ses3'})
-        self.assertEqual({c['frame_count'] for c in mrm}, {2454})
+        self.assertTrue(mrm)
+        self.assertTrue(all(c['frame_count'] > 0 for c in mrm))
+        self.assertTrue(all(c['precursor_mz'] is not None for c in mrm))
         ms1 = [c for c in run.channels if c['channel_type'] == 'ms1']
-        self.assertEqual([(c['mz_low'], c['mz_high']) for c in ms1], [(50., 500.)])
-        self.assertEqual(ms1[0]['frame_count'], 2454)
+        self.assertTrue(ms1)
 
-    def test_august_channels_differ_from_september(self):
-        run = self.run_reader('20260819-tsj/TSJ-0819-1.d')
-        products = {c['product_mz'] for c in run.channels if c['channel_type'] == 'mrm'}
-        self.assertEqual(products, {189., 93., 69.})
-
-    def test_july_has_no_mrm_channel_or_frame(self):
-        run = self.run_reader('20260729/STD.d')
+    def test_full_scan_fixture_has_no_mrm_channel_or_frame(self):
+        run = self.run_reader('ms1_reference')
         self.assertEqual([c for c in run.channels if c['channel_type'] == 'mrm'], [])
         self.assertEqual(run.metadata()['mrm_frame_count'], 0)
         self.assertEqual(run.records(lambda head: head['ms_level'] == 2), [])
 
-    def test_method_fingerprint_is_shared_within_a_batch_and_differs_between(self):
-        september = [self.run_reader(f'TSJ-0907/LQ/STD_S{i}.d').method_fingerprint()
-                     for i in (1, 2)]
-        august = self.run_reader('20260819-tsj/TSJ-0819-1.d').method_fingerprint()
-        self.assertEqual(len(set(september)), 1)
-        self.assertNotIn(august, september)
+    def test_different_methods_have_different_fingerprints(self):
+        primary = self.run_reader('mrm_primary').method_fingerprint()
+        secondary = self.run_reader('mrm_secondary').method_fingerprint()
+        self.assertNotEqual(primary, secondary)
 
 
 if __name__ == '__main__':

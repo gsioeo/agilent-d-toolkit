@@ -96,6 +96,8 @@ quant_config/
 !mrm_quant/templates/*.json
 # Test fixtures are synthetic.
 !tests/*.json
+# Real-data test locations and expected observations remain local.
+tests/data-paths.local.json
 
 # ---- credentials and secrets ----------------------------------------
 .env

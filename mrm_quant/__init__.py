@@ -5,6 +5,6 @@ Read-only with respect to the raw Agilent ``.d`` datasets and to the existing
 nothing about a particular batch, transition or concentration is hardcoded here.
 """
 
-VERSION = 'v1'
+VERSION = 'v2'
 
 __all__ = ['VERSION']

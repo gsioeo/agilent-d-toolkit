@@ -384,6 +384,15 @@ def read_records(path, *, header_filter=None, **options):
         return run.records(header_filter)
 
 
+def find_datasets(source, *, ingest_dir=None):
+    """Return sorted ``.d`` datasets for one dataset or a containing folder."""
+    source = Path(source)
+    if source.is_dir() and source.name.lower().endswith('.d'):
+        return [source]
+    reader = load_reader(ingest_dir)
+    return [Path(path) for path in sorted(reader.find_datasets(str(source)))]
+
+
 def method_channels(path, **options):
     with RunReader(path, **options) as run:
         return run.channels

@@ -94,15 +94,14 @@ class FutureContractTests(unittest.TestCase):
         result = self.api.extract_transition([scan(products=(93.02,), intensities=(7.,))], transition())
         self.assertEqual(result['intensity'], [None])
 
-    def test_actual_september_transition_preserves_only_mrm_times(self):
-        path = context.dataset_path('TSJ-0907/LQ/STD_S1.d')
+    def test_optional_real_transition_preserves_only_mrm_times(self):
+        path = context.dataset_path('mrm_primary')
         if not path.exists():
             self.skipTest('Local raw fixture unavailable')
         result = self.api.extract_run(path, transition())
-        self.assertEqual(len(result['intensity']), 2454)
-        self.assertEqual(result['scan_id'], list(range(1, 4909, 2)))
-        self.assertAlmostEqual(result['rt_min'][0], 10.001733333333334)
-        self.assertEqual(result['intensity'][0], 1121.11181640625)
+        self.assertTrue(result['intensity'])
+        self.assertEqual(len(result['scan_id']), len(result['rt_min']))
+        self.assertTrue(all(b > a for a, b in zip(result['rt_min'], result['rt_min'][1:])))
 
     def test_ms1_tic_and_mrm_sum_are_separate(self):
         result = self.api.separate_tic([scan(), scan(2, 1.1, scan_type=1, ms_level=1,

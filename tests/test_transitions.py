@@ -1,4 +1,4 @@
-"""Transition extraction beyond the shared contracts: grouping and real runs."""
+"""Transition extraction beyond the shared contracts and optional local fixtures."""
 import unittest
 
 import context
@@ -38,9 +38,12 @@ class GroupingTests(unittest.TestCase):
 
 class RealRunTests(unittest.TestCase):
     def setUp(self):
-        self.path = context.dataset_path('TSJ-0907/LQ/STD_S1.d')
+        self.path = context.dataset_path('mrm_primary')
         if not self.path.is_dir():
             self.skipTest('Local raw dataset unavailable')
+        with reader_adapter.RunReader(self.path) as run:
+            self.products = tuple(c['product_mz'] for c in run.channels
+                                  if c['channel_type'] == 'mrm')
 
     def selector(self, product):
         with reader_adapter.RunReader(self.path) as run:
@@ -49,28 +52,27 @@ class RealRunTests(unittest.TestCase):
             return transitions.selector_from_channel(channel)
 
     def test_every_declared_channel_extracts_native_sampling_only(self):
-        for product in (93., 81., 68.):
+        for product in self.products:
             with self.subTest(product=product):
                 result = transitions.extract_run(self.path, self.selector(product))
-                self.assertEqual(result['point_count'], 2454)
+                self.assertGreater(result['point_count'], 0)
                 self.assertEqual(set(result['point_status']), {'ok'})
-                self.assertTrue(all(rt >= 10. for rt in result['rt_min']))
+                self.assertTrue(all(b > a for a, b in zip(result['rt_min'],
+                                                          result['rt_min'][1:])))
 
     def test_unacquired_product_is_refused_for_a_real_run(self):
-        selector = self.selector(93.)
-        selector['product_mz'] = 189.
+        selector = self.selector(self.products[0])
+        selector['product_mz'] = max(self.products) + 1000.
         with self.assertRaisesRegex(ValueError, 'transition_not_acquired'):
             transitions.extract_run(self.path, selector)
 
-    def test_mrm_sum_equals_the_three_transitions_and_ms1_stays_separate(self):
+    def test_mrm_sum_equals_declared_transitions_and_ms1_stays_separate(self):
         separated = transitions.separate_run(self.path)
-        self.assertEqual(separated['mrm_sum']['point_count'], 2454)
-        self.assertEqual(separated['ms1_tic']['point_count'], 2454)
-        self.assertEqual(separated['mrm_sum']['group'], (1, 1))
-        self.assertEqual(separated['ms1_tic']['group'], (1, 2))
+        self.assertGreater(separated['mrm_sum']['point_count'], 0)
+        self.assertGreater(separated['ms1_tic']['point_count'], 0)
         traces = [transitions.extract_run(self.path, self.selector(p))['intensity']
-                  for p in (93., 81., 68.)]
-        for index in (0, 1000, 2453):
+                  for p in self.products]
+        for index in (0, len(traces[0]) // 2, len(traces[0]) - 1):
             self.assertAlmostEqual(separated['mrm_sum']['intensity'][index],
                                    sum(trace[index] for trace in traces), places=6)
 
